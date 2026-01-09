@@ -80,7 +80,10 @@ runs:
           echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
           
           mkdir -p "${SDKDIR}"
+          echo "Downloading SDK from $DOWNLOAD_URL..."
           curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
+          
+          echo "Extracting SDK..."
           tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
           
           if [ "$PLATFORM" == "bcm53xx" ]; then
@@ -89,35 +92,37 @@ runs:
           fi
 
     - name: Setup Golang and Feeds
-    shell: bash
-    run: |
-      cd "${SDK_PATH}"
-      
-      # 1. Prebuilt Golang installieren (falls vorhanden)
-      if [ -d "${{ github.workspace }}/prebuilt" ]; then
-        mkdir -p "bin/packages/${PLATFORM}/custom"
-        cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
-      fi
-      
-      # 2. Feeds konfigurieren
-      cp "${{ github.workspace }}/feeds.conf" feeds.conf
-      
-      # 3. Feeds updaten
-      ./scripts/feeds update -a
-      
-      # 4. NUR die wichtigsten Feeds installieren (vermeidet Fehler in telephony)
-      ./scripts/feeds install -a -p base
-      ./scripts/feeds install -a -p packages
-      # Telephony-Fehler ignorieren wir durch '|| true'
-      ./scripts/feeds install -a -p telephony || true 
-      ./scripts/feeds install -a
+      shell: bash
+      run: |
+        cd "${SDK_PATH}"
+        
+        # 1. Prebuilt Golang installieren (falls vorhanden)
+        if [ -d "${{ github.workspace }}/prebuilt" ]; then
+          mkdir -p "bin/packages/${PLATFORM}/custom"
+          cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
+        fi
+        
+        # 2. Feeds konfigurieren
+        cp "${{ github.workspace }}/feeds.conf" feeds.conf
+        
+        # 3. Feeds updaten
+        ./scripts/feeds update -a
+        
+        # 4. NUR die wichtigsten Feeds installieren (vermeidet Fehler in telephony)
+        ./scripts/feeds install -a -p base
+        ./scripts/feeds install -a -p packages
+        # Telephony-Fehler ignorieren wir durch '|| true'
+        ./scripts/feeds install -a -p telephony || true 
+        ./scripts/feeds install -a
 
     - name: Manual Module Checkout
       shell: bash
       run: |
         cd "${SDK_PATH}/package"
         MODULE_NAME="${{ inputs.module }}"
-        git clone "https://github.com/OpenTollGate/${MODULE_NAME}.git" "$MODULE_NAME"
+        REPO_URL="https://github.com/OpenTollGate/${MODULE_NAME}.git"
+        echo "Cloning $MODULE_NAME directly into SDK package directory..."
+        git clone "$REPO_URL" "$MODULE_NAME"
 
     - name: Compile Module
       shell: bash
