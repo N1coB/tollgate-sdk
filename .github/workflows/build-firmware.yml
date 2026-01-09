@@ -37,7 +37,7 @@ jobs:
           nostrPrivateKey: ${{ secrets.NSECBECH }}
 
   build:
-    runs-on: runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04
     needs: prepare
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     strategy:
@@ -58,14 +58,12 @@ jobs:
           workflow_conclusion: success
           name: golang-${{ matrix.target.model }}-${{ matrix.target.platform }}-${{ matrix.target.subtarget }}
           path: prebuilt/
-          # GEÄNDERT: Nutzt jetzt dein Repo statt dem Original
           repo: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout SDK
         uses: actions/checkout@v4
         with:
-          # GEÄNDERT: Lädt den Code aus deinem aktuellen Fork
           path: .
 
       - name: Build Firmware
@@ -77,6 +75,8 @@ jobs:
           subtarget: ${{ matrix.target.subtarget }}
           prebuilt_golang: ${{ github.event_name == 'workflow_run' && 'prebuilt' || '' }}
           module: ${{ matrix.module }}
+          packageName: ${{ matrix.module }}
+          makeFilePath: "package/${{ matrix.module }}/Makefile"
 
       - name: Debug Package Path
         run: |
@@ -143,6 +143,5 @@ jobs:
         uses: peter-evans/repository-dispatch@v2
         with:
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          # GEÄNDERT: Falls du tollgate-os ebenfalls geforkt hast, hier anpassen
           repository: ${{ github.repository_owner }}/tollgate-os
           event-type: update-release-json
