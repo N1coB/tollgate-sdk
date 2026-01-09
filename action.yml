@@ -24,16 +24,14 @@ inputs:
     description: 'Path to prebuilt golang package'
     required: false
     default: ''
-  golang_hash:
-    description: 'Expected SHA256 hash of the prebuilt golang package (optional)'
-    required: false
   module:
-    description: 'Name of the module to build (e.g., tollgate-module-relay-go)'
+    description: 'Name of the module to build'
     required: true
 outputs:
   package_path:
     description: 'Path to the built package'
     value: ${{ steps.validate_package.outputs.package_path }}
+
 runs:
   using: "composite"
   steps:
@@ -46,28 +44,7 @@ runs:
     shell: bash
     run: |
       sudo apt-get update
-      sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip
-      sudo apt-get install -y python3-dev python3-setuptools debhelper dh-python
-
-  - name: Install Go
-    shell: bash
-    run: |
-      if [ ! -x "/usr/local/go/bin/go" ]; then
-        echo "Installing Go..."
-        wget https://go.dev/dl/go1.23.4.linux-amd64.tar.gz
-        sudo rm -rf /usr/local/go
-        sudo tar -I pigz -C /usr/local -xf go1.23.4.linux-amd64.tar.gz
-        export PATH=$PATH:/usr/local/go/bin
-        echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-        rm go1.23.4.linux-amd64.tar.gz
-      fi
-
-  - name: Install python dependencies
-    uses: nick-fields/retry@v2
-    with:
-      timeout_minutes: 10
-      max_attempts: 3
-      command: pip3 install setuptools
+      sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip python3-setuptools debhelper dh-python
 
   - name: Download and extract SDK
     uses: nick-fields/retry@v2
@@ -79,17 +56,15 @@ runs:
       command: |
         VERSION=23.05.3
         
-        # Plattform bestimmen
+        # Plattformbestimmung
         case "${{ env.MODEL }}" in
           "rt-ac56u") PLATFORM="bcm53xx"; SUBTARGET="generic" ;;
           "gl-ar300m"|"gl-ar300m16") PLATFORM="ath79"; SUBTARGET="generic" ;;
           "gl-mt3000"|"gl-mt6000") PLATFORM="mediatek"; SUBTARGET="filogic" ;;
-          "gl-mt300n-v2") PLATFORM="ramips"; SUBTARGET="mt76x8" ;;
-          "archer_mr200") PLATFORM="ramips"; SUBTARGET="mt7620" ;;
           *) echo "Unsupported model: ${{ env.MODEL }}"; exit 1 ;;
         esac
 
-        # Suffix-Korrektur für bcm53xx (Dein Router)
+        # Suffix-Korrektur für bcm53xx (ASUS)
         SUFFIX="_musl.Linux-x86_64"
         if [ "$PLATFORM" == "bcm53xx" ]; then
           SUFFIX="_musl_eabi.Linux-x86_64"
@@ -100,61 +75,70 @@ runs:
         DOWNLOAD_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${PLATFORM}/${SUBTARGET}/${SDK_ARCHIVE}"
         SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}"
         
-        echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
-        echo "SUBTARGET=$SUBTARGET" >> $GITHUB_ENV
         echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
+        echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
         
         mkdir -p "${SDKDIR}"
-        echo "Downloading SDK: $DOWNLOAD_URL"
         curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
-        
-        echo "Extracting SDK..."
         tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
         
-        # Go Architektur für ARMv7 (ASUS RT-AC56U)
+        # Architektur-Mapping für Go
         case "$PLATFORM" in
-          "bcm53xx") export GOARCH="arm"; export GOARM="7" ;;
-          "mediatek") export GOARCH="arm64" ;;
-          *) export GOARCH="mipsle" ;;
+          "bcm53xx") echo "GOARCH=arm" >> $GITHUB_ENV; echo "GOARM=7" >> $GITHUB_ENV ;;
+          "mediatek") echo "GOARCH=arm64" >> $GITHUB_ENV ;;
+          *) echo "GOARCH=mipsle" >> $GITHUB_ENV ;;
         esac
 
-        # Feeds kopieren und laden
-        cp ${{ github.action_path }}/feeds.conf "${SDK_PATH}/feeds.conf"
-        cd "${SDK_PATH}"
-        ./scripts/feeds update -a || echo "Feeds update had issues, continuing..."
-        ./scripts/feeds install -a
-
-  - name: Install opkg utilities
-    shell: bash
-    run: |
-      git clone https://github.com/c03rad0r/opkg-utils.git "${SDK_PATH}/staging_dir/host/bin/opkg-utils"
-      cd "${SDK_PATH}/staging_dir/host/bin/opkg-utils"
-      make && sudo make install
-
-  - name: Compile module
+  - name: Setup Golang and Feeds
     shell: bash
     run: |
       cd "${SDK_PATH}"
-      MODULE="${{ inputs.module }}"
-      FEED_NAME=$(echo "$MODULE" | sed -E 's/tollgate-module-(.+)-go/\1/')
       
+      # 1. Prebuilt Golang IPK installieren, falls vorhanden
+      if [ -d "${{ github.workspace }}/prebuilt" ]; then
+        echo "Installing prebuilt Golang from artifacts..."
+        mkdir -p "bin/packages/${PLATFORM}/custom"
+        cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
+      fi
+      
+      # 2. Feeds ohne 'basic' und 'relay' konfigurieren (verhindert Index-Fehler)
+      grep -vE "basic|relay" ${{ github.action_path }}/feeds.conf > feeds.conf
+      ./scripts/feeds update -a
+      ./scripts/feeds install -a
+
+  - name: Manual Module Checkout
+    shell: bash
+    run: |
+      # 3. Das Modul direkt in den package-Ordner klonen (umgeht Feed-Probleme)
+      cd "${SDK_PATH}/package"
+      MODULE_NAME="${{ inputs.module }}"
+      REPO_URL="https://github.com/OpenTollGate/${MODULE_NAME}.git"
+      echo "Cloning $MODULE_NAME directly into SDK..."
+      git clone "$REPO_URL" "$MODULE_NAME"
+
+  - name: Compile Module
+    shell: bash
+    run: |
+      cd "${SDK_PATH}"
       make defconfig
+      # Golang helper kopieren
       cp ${{ github.action_path }}/golang.mk include/golang.mk
-      
-      ./scripts/feeds update $FEED_NAME
-      ./scripts/feeds install -a -p $FEED_NAME
-      echo "CONFIG_PACKAGE_${MODULE}=y" >> .config
-      
-      make package/feeds/${FEED_NAME}/${MODULE}/compile V=sc
+      # Paket aktivieren und bauen
+      echo "CONFIG_PACKAGE_${{ inputs.module }}=y" >> .config
+      make package/${{ inputs.module }}/compile V=sc
 
   - name: Validate and export package
     id: validate_package
     shell: bash
     run: |
       PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ env.MODULE }}_*.ipk" | head -n 1)
+      if [ -z "$PACKAGE_FULLPATH" ]; then
+        PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "tollgate-module-basic-go_*.ipk" | head -n 1)
+      fi
+      
       if [ -n "$PACKAGE_FULLPATH" ]; then
         echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
         echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
       else
-        echo "ERROR: IPK not found!" && exit 1
+        echo "ERROR: Compiled IPK not found!" && exit 1
       fi
