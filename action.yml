@@ -35,128 +35,95 @@ outputs:
 runs:
   using: "composite"
   steps:
-  - name: Setup python 3.10
-    uses: actions/setup-python@v4
-    with:
-      python-version: "3.10" # GEÄNDERT von 3.12 auf 3.10
+    - name: Setup python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
 
-  - name: Install dependencies
-    shell: bash
-    run: |
-      sudo apt-get update
-      # Hinzugefügt: python3-distutils (wichtig für ältere SDKs auf Ubuntu)
-      sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip python3-setuptools debhelper dh-python python3-distutils || true
+    - name: Install dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip python3-setuptools debhelper dh-python python3-distutils || true
 
-  - name: Download and extract SDK
-    uses: nick-fields/retry@v2
-    env:
-      MODEL: ${{ inputs.model }}
-    with:
-      timeout_minutes: 10
-      max_attempts: 3
-      command: |
-        VERSION=23.05.3
-        
-        # Plattformbestimmung und Suffix-Logik
-        case "${{ env.MODEL }}" in
-          "rt-ac56u") 
-            PLATFORM="bcm53xx"; SUBTARGET="generic"; SUFFIX="_musl_eabi.Linux-x86_64" 
-            ;;
-          "gl-ar300m"|"gl-ar300m16") 
-            PLATFORM="ath79"; SUBTARGET="generic"; SUFFIX="_musl.Linux-x86_64" 
-            ;;
-          "gl-mt3000"|"gl-mt6000") 
-            PLATFORM="mediatek"; SUBTARGET="filogic"; SUFFIX="_musl.Linux-x86_64" 
-            ;;
-          *) 
-            PLATFORM="${{ inputs.platform }}"; SUBTARGET="${{ inputs.subtarget }}"; SUFFIX="_musl.Linux-x86_64" 
-            ;;
-        esac
+    - name: Download and extract SDK
+      uses: nick-fields/retry@v2
+      env:
+        MODEL: ${{ inputs.model }}
+      with:
+        timeout_minutes: 10
+        max_attempts: 3
+        command: |
+          VERSION=23.05.3
+          
+          case "${{ env.MODEL }}" in
+            "rt-ac56u") 
+              PLATFORM="bcm53xx"; SUBTARGET="generic"; SUFFIX="_musl_eabi.Linux-x86_64" 
+              ;;
+            "gl-ar300m"|"gl-ar300m16") 
+              PLATFORM="ath79"; SUBTARGET="generic"; SUFFIX="_musl.Linux-x86_64" 
+              ;;
+            "gl-mt3000"|"gl-mt6000") 
+              PLATFORM="mediatek"; SUBTARGET="filogic"; SUFFIX="_musl.Linux-x86_64" 
+              ;;
+            *) 
+              PLATFORM="${{ inputs.platform }}"; SUBTARGET="${{ inputs.subtarget }}"; SUFFIX="_musl.Linux-x86_64" 
+              ;;
+          esac
 
-        SDKDIR=/tmp/openwrt-sdk
-        SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}.tar.xz"
-        DOWNLOAD_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${PLATFORM}/${SUBTARGET}/${SDK_ARCHIVE}"
-        SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}"
-        
-        echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
-        echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
-        
-        mkdir -p "${SDKDIR}"
-        echo "Downloading SDK from $DOWNLOAD_URL..."
-        curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
-        
-        echo "Extracting SDK..."
-        tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
-        
-        # Architektur-Mapping für Go (ARMv7 für bcm53xx)
-        case "$PLATFORM" in
-          "bcm53xx") 
+          SDKDIR=/tmp/openwrt-sdk
+          SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}.tar.xz"
+          DOWNLOAD_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${PLATFORM}/${SUBTARGET}/${SDK_ARCHIVE}"
+          SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}"
+          
+          echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
+          echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
+          
+          mkdir -p "${SDKDIR}"
+          curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
+          tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
+          
+          if [ "$PLATFORM" == "bcm53xx" ]; then
             echo "GOARCH=arm" >> $GITHUB_ENV
-            echo "GOARM=7" >> $GITHUB_ENV 
-            ;;
-          "mediatek") 
-            echo "GOARCH=arm64" >> $GITHUB_ENV 
-            ;;
-          *) 
-            echo "GOARCH=mipsle" >> $GITHUB_ENV 
-            ;;
-        esac
+            echo "GOARM=7" >> $GITHUB_ENV
+          fi
 
-  - name: Setup Golang and Feeds
-    shell: bash
-    run: |
-      cd "${SDK_PATH}"
-      
-      # 1. Prebuilt Golang installieren, falls vorhanden
-      # Wir suchen im Workspace nach dem Ordner 'prebuilt'
-      if [ -d "${{ github.workspace }}/prebuilt" ]; then
-        echo "Prebuilt Golang found. Installing..."
-        mkdir -p "bin/packages/${PLATFORM}/custom"
-        cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
-      fi
-      
-      # 2. Feeds ohne 'basic' und 'relay' konfigurieren (verhindert Index-Fehler)
-      # Wir nehmen die feeds.conf aus deinem Repository
-      cp "${{ github.workspace }}/feeds.conf" feeds.conf
-      ./scripts/feeds update -a
-      ./scripts/feeds install -a
+    - name: Setup Golang and Feeds
+      shell: bash
+      run: |
+        cd "${SDK_PATH}"
+        if [ -d "${{ github.workspace }}/prebuilt" ]; then
+          mkdir -p "bin/packages/${PLATFORM}/custom"
+          cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
+        fi
+        cp "${{ github.workspace }}/feeds.conf" feeds.conf
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-  - name: Manual Module Checkout
-    shell: bash
-    run: |
-      # Das Modul direkt in den package-Ordner klonen umgeht Feed-Index Fehler
-      cd "${SDK_PATH}/package"
-      MODULE_NAME="${{ inputs.module }}"
-      REPO_URL="https://github.com/OpenTollGate/${MODULE_NAME}.git"
-      echo "Cloning $MODULE_NAME directly into SDK package directory..."
-      git clone "$REPO_URL" "$MODULE_NAME"
+    - name: Manual Module Checkout
+      shell: bash
+      run: |
+        cd "${SDK_PATH}/package"
+        MODULE_NAME="${{ inputs.module }}"
+        git clone "https://github.com/OpenTollGate/${MODULE_NAME}.git" "$MODULE_NAME"
 
-  - name: Compile Module
-    shell: bash
-    run: |
-      cd "${SDK_PATH}"
-      # Sicherstellen, dass die Konfiguration aktuell ist
-      make defconfig
-      # Golang helper für das SDK bereitstellen
-      cp ${{ github.action_path }}/golang.mk include/golang.mk
-      # Modul in der .config aktivieren
-      echo "CONFIG_PACKAGE_${{ inputs.module }}=y" >> .config
-      # Kompilieren (Wir nutzen den direkten Pfad im package-Ordner)
-      make package/${{ inputs.module }}/compile V=s
+    - name: Compile Module
+      shell: bash
+      run: |
+        cd "${SDK_PATH}"
+        make defconfig
+        cp ${{ github.action_path }}/golang.mk include/golang.mk
+        echo "CONFIG_PACKAGE_${{ inputs.module }}=y" >> .config
+        make package/${{ inputs.module }}/compile V=s
 
-  - name: Validate and export package
-    id: validate_package
-    shell: bash
-    run: |
-      # Suche nach der erzeugten .ipk Datei
-      PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ inputs.module }}_*.ipk" | head -n 1)
-      
-      if [ -n "$PACKAGE_FULLPATH" ]; then
-        echo "Found package at: $PACKAGE_FULLPATH"
-        echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
-        echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
-      else
-        echo "ERROR: Compiled IPK not found!"
-        find "${SDK_PATH}/bin/packages" -name "*.ipk"
-        exit 1
-      fi
+    - name: Validate and export package
+      id: validate_package
+      shell: bash
+      run: |
+        PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ inputs.module }}_*.ipk" | head -n 1)
+        if [ -n "$PACKAGE_FULLPATH" ]; then
+          echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
+          echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
+        else
+          echo "ERROR: Compiled IPK not found!" && exit 1
+        fi
