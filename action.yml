@@ -104,6 +104,10 @@ runs:
             PLATFORM="ramips"
             SUBTARGET="mt7620"
             ;;
+            "rt-ac56u")
+            PLATFORM="bcm53xx"
+            SUBTARGET="generic"
+            ;;
           *)
             echo "Unsupported model: ${{ env.MODEL }}"
             exit 1
