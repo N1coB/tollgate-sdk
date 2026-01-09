@@ -67,8 +67,7 @@ runs:
     with:
       timeout_minutes: 10
       max_attempts: 3
-      command: |
-        pip3 install setuptools
+      command: pip3 install setuptools
 
   - name: Download and extract SDK
     uses: nick-fields/retry@v2
@@ -79,117 +78,73 @@ runs:
       max_attempts: 3
       command: |
         VERSION=23.05.3
-
-        # Bestimmung von PLATFORM und SUBTARGET basierend auf MODEL
+        
+        # Plattform bestimmen
         case "${{ env.MODEL }}" in
-          "gl-mt300n-v2")
-            PLATFORM="ramips"
-            SUBTARGET="mt76x8"
-            ;;
-          "gl-ar300m"|"gl-ar300m16")
-            PLATFORM="ath79"
-            SUBTARGET="generic"
-            ;;
-          "gl-mt3000"|"gl-mt6000")
-            PLATFORM="mediatek"
-            SUBTARGET="filogic"
-            ;;
-          "gl-e750")
-            VERSION="snapshot"
-            PLATFORM="ath79"
-            SUBTARGET="nand"
-            ;;
-          "archer_mr200")
-            PLATFORM="ramips"
-            SUBTARGET="mt7620"
-            ;;
-          "rt-ac56u")
-            PLATFORM="bcm53xx"
-            SUBTARGET="generic"
-            ;;
-          *)
-            echo "Unsupported model: ${{ env.MODEL }}"
-            exit 1
-            ;;
+          "rt-ac56u") PLATFORM="bcm53xx"; SUBTARGET="generic" ;;
+          "gl-ar300m"|"gl-ar300m16") PLATFORM="ath79"; SUBTARGET="generic" ;;
+          "gl-mt3000"|"gl-mt6000") PLATFORM="mediatek"; SUBTARGET="filogic" ;;
+          "gl-mt300n-v2") PLATFORM="ramips"; SUBTARGET="mt76x8" ;;
+          "archer_mr200") PLATFORM="ramips"; SUBTARGET="mt7620" ;;
+          *) echo "Unsupported model: ${{ env.MODEL }}"; exit 1 ;;
         esac
 
-        # Spezialfall für bcm53xx (Dein ASUS Router): benötigt _eabi im Dateinamen
+        # Suffix-Korrektur für bcm53xx (Dein Router)
         SUFFIX="_musl.Linux-x86_64"
         if [ "$PLATFORM" == "bcm53xx" ]; then
           SUFFIX="_musl_eabi.Linux-x86_64"
         fi
 
-        echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
-        echo "SUBTARGET=$SUBTARGET" >> $GITHUB_ENV
-        
         SDKDIR=/tmp/openwrt-sdk
         SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}.tar.xz"
         DOWNLOAD_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${PLATFORM}/${SUBTARGET}/${SDK_ARCHIVE}"
         SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}"
         
+        echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
+        echo "SUBTARGET=$SUBTARGET" >> $GITHUB_ENV
         echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
         
         mkdir -p "${SDKDIR}"
-        echo "Downloading SDK from: $DOWNLOAD_URL"
-        (cd "${SDKDIR}" && curl -L -O "${DOWNLOAD_URL}")
+        echo "Downloading SDK: $DOWNLOAD_URL"
+        curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
         
         echo "Extracting SDK..."
         tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
         
-        # Verzeichnisse vorbereiten
-        mkdir -p "${SDK_PATH}/include"
-        mkdir -p "${SDK_PATH}/bin/packages/$PLATFORM"
-        
-        # Go-Architektur-Mapping (BCM53XX = ARMv7)
+        # Go Architektur für ARMv7 (ASUS RT-AC56U)
         case "$PLATFORM" in
-          "bcm53xx")
-            export GOOS="linux"
-            export GOARCH="arm"
-            export GOARM="7"
-            ;;
-          "ramips"|"ath79")
-            export GOOS="linux"
-            export GOARCH="mipsle"
-            ;;
-          "mediatek")
-            export GOOS="linux"
-            export GOARCH="arm64"
-            ;;
+          "bcm53xx") export GOARCH="arm"; export GOARM="7" ;;
+          "mediatek") export GOARCH="arm64" ;;
+          *) export GOARCH="mipsle" ;;
         esac
 
-        echo "Copying feeds.conf..."
-        cp ${{github.action_path}}/feeds.conf "${SDK_PATH}"/feeds.conf
+        # Feeds kopieren und laden
+        cp ${{ github.action_path }}/feeds.conf "${SDK_PATH}/feeds.conf"
         cd "${SDK_PATH}"
-        ./scripts/feeds update -a
+        ./scripts/feeds update -a || echo "Feeds update had issues, continuing..."
         ./scripts/feeds install -a
 
   - name: Install opkg utilities
     shell: bash
     run: |
-      # Nutzt die SDK_PATH Variable aus der Umgebung
       git clone https://github.com/c03rad0r/opkg-utils.git "${SDK_PATH}/staging_dir/host/bin/opkg-utils"
       cd "${SDK_PATH}/staging_dir/host/bin/opkg-utils"
       make && sudo make install
 
-  - name: Setup Build Environment & Compile
+  - name: Compile module
     shell: bash
     run: |
       cd "${SDK_PATH}"
-      
-      # Modul-Variablen setzen
       MODULE="${{ inputs.module }}"
       FEED_NAME=$(echo "$MODULE" | sed -E 's/tollgate-module-(.+)-go/\1/')
       
-      # Konfiguration
       make defconfig
-      cp ${{github.action_path}}/golang.mk include/golang.mk
+      cp ${{ github.action_path }}/golang.mk include/golang.mk
       
-      # Feed Installation
       ./scripts/feeds update $FEED_NAME
       ./scripts/feeds install -a -p $FEED_NAME
       echo "CONFIG_PACKAGE_${MODULE}=y" >> .config
       
-      # Kompilieren
       make package/feeds/${FEED_NAME}/${MODULE}/compile V=sc
 
   - name: Validate and export package
@@ -201,6 +156,5 @@ runs:
         echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
         echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
       else
-        echo "ERROR: Package not found!"
-        exit 1
+        echo "ERROR: IPK not found!" && exit 1
       fi
