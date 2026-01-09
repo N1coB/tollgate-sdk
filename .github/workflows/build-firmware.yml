@@ -257,7 +257,7 @@ jobs:
       - name: Publish Package NIP-94 Metadata
         id: publish_package
         if: steps.upload_package.outputs.success == 'true'
-        uses: OpenTollGate/nostr-publish-file-metadata-action/python@main
+        uses: OpenTollGate/nostr-publish-file-metadata-action@v0.1.0
         with:
           relays: wss://relay.damus.io,wss://nos.lol,wss://nostr.mom/
           url: ${{ steps.upload_package.outputs.url }}
