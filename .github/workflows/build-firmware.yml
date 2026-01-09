@@ -13,7 +13,7 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'  # Täglich um Mitternacht
+    - cron: '0 0 * * *'
 
 jobs:
   prepare:
@@ -25,12 +25,11 @@ jobs:
         run: |
           echo "This is a test file" > test.txt
           ORIGINAL_HASH=$(sha256sum test.txt | cut -d' ' -f1)
-          echo "Original hash: $ORIGINAL_HASH"
           echo "ORIGINAL_HASH=$ORIGINAL_HASH" >> $GITHUB_ENV
 
       - name: Upload Test File to Blossom
         id: upload_test
-        continue-on-error: true # Fehler hier erlauben, falls Secret NSECBECH fehlt
+        continue-on-error: true
         uses: c03rad0r/cli-blossom-uploader-go@main
         with:
           host: "https://blossom.swissdash.site"
@@ -48,24 +47,25 @@ jobs:
           {model: "gl-ar300m", platform: "ath79", subtarget: "generic"},
           {model: "gl-mt3000", platform: "mediatek", subtarget: "filogic"},
           {model: "gl-mt6000", platform: "mediatek", subtarget: "filogic"},
-          {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"} # Dein Router
+          {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"}
         ]
     steps:
       - name: Download Prebuilt Golang
         uses: dawidd6/action-download-artifact@v2
-        continue-on-error: true # Korrekt platziert (außerhalb von 'with')
+        continue-on-error: true
         with:
           workflow: prebuild-golang.yml
           workflow_conclusion: success
           name: golang-${{ matrix.target.model }}-${{ matrix.target.platform }}-${{ matrix.target.subtarget }}
           path: prebuilt/
-          repo: OpenTollGate/tollgate-sdk
+          # GEÄNDERT: Nutzt jetzt dein Repo statt dem Original
+          repo: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout SDK
         uses: actions/checkout@v4
         with:
-          repository: OpenTollGate/tollgate-sdk
+          # GEÄNDERT: Lädt den Code aus deinem aktuellen Fork
           path: .
 
       - name: Build Firmware
@@ -88,7 +88,6 @@ jobs:
             MODULE_NAME=$(echo "${{ matrix.module }}" | sed 's/tollgate-module-//;s/-go//')
             echo "MODULE_NAME=$MODULE_NAME" >> $GITHUB_ENV
             
-            # Zuordnung der Architektur für bcm53xx ergänzt
             if [[ "${{ matrix.target.platform }}" == "ath79" ]]; then
               ARCH="mipsel_24kc"
             elif [[ "${{ matrix.target.platform }}" == "mediatek" ]]; then
@@ -120,7 +119,7 @@ jobs:
       - name: Publish Package NIP-94 Metadata
         id: publish_package
         if: steps.upload_package.outputs.success == 'true'
-        uses: OpenTollGate/nostr-publish-file-metadata-action@v0.1.0 # Korrigierter Pfad
+        uses: OpenTollGate/nostr-publish-file-metadata-action@v0.1.0
         with:
           relays: wss://relay.damus.io,wss://nos.lol,wss://nostr.mom/
           url: ${{ steps.upload_package.outputs.url }}
@@ -144,5 +143,6 @@ jobs:
         uses: peter-evans/repository-dispatch@v2
         with:
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          repository: OpenTollGate/tollgate-os
+          # GEÄNDERT: Falls du tollgate-os ebenfalls geforkt hast, hier anpassen
+          repository: ${{ github.repository_owner }}/tollgate-os
           event-type: update-release-json
