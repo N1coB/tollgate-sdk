@@ -44,7 +44,8 @@ runs:
     shell: bash
     run: |
       sudo apt-get update
-      sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip python3-setuptools debhelper dh-python
+      # Hinzugefügt: python3-distutils (wichtig für ältere SDKs auf Ubuntu)
+      sudo apt-get install -y jq git libncurses5-dev libncursesw5-dev pigz binutils-dev python3-pip python3-setuptools debhelper dh-python python3-distutils || true
 
   - name: Download and extract SDK
     uses: nick-fields/retry@v2
@@ -56,19 +57,21 @@ runs:
       command: |
         VERSION=23.05.3
         
-        # Plattformbestimmung
+        # Plattformbestimmung und Suffix-Logik
         case "${{ env.MODEL }}" in
-          "rt-ac56u") PLATFORM="bcm53xx"; SUBTARGET="generic" ;;
-          "gl-ar300m"|"gl-ar300m16") PLATFORM="ath79"; SUBTARGET="generic" ;;
-          "gl-mt3000"|"gl-mt6000") PLATFORM="mediatek"; SUBTARGET="filogic" ;;
-          *) echo "Unsupported model: ${{ env.MODEL }}"; exit 1 ;;
+          "rt-ac56u") 
+            PLATFORM="bcm53xx"; SUBTARGET="generic"; SUFFIX="_musl_eabi.Linux-x86_64" 
+            ;;
+          "gl-ar300m"|"gl-ar300m16") 
+            PLATFORM="ath79"; SUBTARGET="generic"; SUFFIX="_musl.Linux-x86_64" 
+            ;;
+          "gl-mt3000"|"gl-mt6000") 
+            PLATFORM="mediatek"; SUBTARGET="filogic"; SUFFIX="_musl.Linux-x86_64" 
+            ;;
+          *) 
+            PLATFORM="${{ inputs.platform }}"; SUBTARGET="${{ inputs.subtarget }}"; SUFFIX="_musl.Linux-x86_64" 
+            ;;
         esac
-
-        # Suffix-Korrektur für bcm53xx (ASUS)
-        SUFFIX="_musl.Linux-x86_64"
-        if [ "$PLATFORM" == "bcm53xx" ]; then
-          SUFFIX="_musl_eabi.Linux-x86_64"
-        fi
 
         SDKDIR=/tmp/openwrt-sdk
         SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}.tar.xz"
@@ -79,14 +82,24 @@ runs:
         echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
         
         mkdir -p "${SDKDIR}"
+        echo "Downloading SDK from $DOWNLOAD_URL..."
         curl -L -C - -O "$DOWNLOAD_URL" --output-dir "$SDKDIR"
+        
+        echo "Extracting SDK..."
         tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
         
-        # Architektur-Mapping für Go
+        # Architektur-Mapping für Go (ARMv7 für bcm53xx)
         case "$PLATFORM" in
-          "bcm53xx") echo "GOARCH=arm" >> $GITHUB_ENV; echo "GOARM=7" >> $GITHUB_ENV ;;
-          "mediatek") echo "GOARCH=arm64" >> $GITHUB_ENV ;;
-          *) echo "GOARCH=mipsle" >> $GITHUB_ENV ;;
+          "bcm53xx") 
+            echo "GOARCH=arm" >> $GITHUB_ENV
+            echo "GOARM=7" >> $GITHUB_ENV 
+            ;;
+          "mediatek") 
+            echo "GOARCH=arm64" >> $GITHUB_ENV 
+            ;;
+          *) 
+            echo "GOARCH=mipsle" >> $GITHUB_ENV 
+            ;;
         esac
 
   - name: Setup Golang and Feeds
@@ -94,51 +107,56 @@ runs:
     run: |
       cd "${SDK_PATH}"
       
-      # 1. Prebuilt Golang IPK installieren, falls vorhanden
+      # 1. Prebuilt Golang installieren, falls vorhanden
+      # Wir suchen im Workspace nach dem Ordner 'prebuilt'
       if [ -d "${{ github.workspace }}/prebuilt" ]; then
-        echo "Installing prebuilt Golang from artifacts..."
+        echo "Prebuilt Golang found. Installing..."
         mkdir -p "bin/packages/${PLATFORM}/custom"
         cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
       fi
       
       # 2. Feeds ohne 'basic' und 'relay' konfigurieren (verhindert Index-Fehler)
-      grep -vE "basic|relay" ${{ github.action_path }}/feeds.conf > feeds.conf
+      # Wir nehmen die feeds.conf aus deinem Repository
+      cp "${{ github.workspace }}/feeds.conf" feeds.conf
       ./scripts/feeds update -a
       ./scripts/feeds install -a
 
   - name: Manual Module Checkout
     shell: bash
     run: |
-      # 3. Das Modul direkt in den package-Ordner klonen (umgeht Feed-Probleme)
+      # Das Modul direkt in den package-Ordner klonen umgeht Feed-Index Fehler
       cd "${SDK_PATH}/package"
       MODULE_NAME="${{ inputs.module }}"
       REPO_URL="https://github.com/OpenTollGate/${MODULE_NAME}.git"
-      echo "Cloning $MODULE_NAME directly into SDK..."
+      echo "Cloning $MODULE_NAME directly into SDK package directory..."
       git clone "$REPO_URL" "$MODULE_NAME"
 
   - name: Compile Module
     shell: bash
     run: |
       cd "${SDK_PATH}"
+      # Sicherstellen, dass die Konfiguration aktuell ist
       make defconfig
-      # Golang helper kopieren
+      # Golang helper für das SDK bereitstellen
       cp ${{ github.action_path }}/golang.mk include/golang.mk
-      # Paket aktivieren und bauen
+      # Modul in der .config aktivieren
       echo "CONFIG_PACKAGE_${{ inputs.module }}=y" >> .config
-      make package/${{ inputs.module }}/compile V=sc
+      # Kompilieren (Wir nutzen den direkten Pfad im package-Ordner)
+      make package/${{ inputs.module }}/compile V=s
 
   - name: Validate and export package
     id: validate_package
     shell: bash
     run: |
-      PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ env.MODULE }}_*.ipk" | head -n 1)
-      if [ -z "$PACKAGE_FULLPATH" ]; then
-        PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "tollgate-module-basic-go_*.ipk" | head -n 1)
-      fi
+      # Suche nach der erzeugten .ipk Datei
+      PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ inputs.module }}_*.ipk" | head -n 1)
       
       if [ -n "$PACKAGE_FULLPATH" ]; then
+        echo "Found package at: $PACKAGE_FULLPATH"
         echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
         echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
       else
-        echo "ERROR: Compiled IPK not found!" && exit 1
+        echo "ERROR: Compiled IPK not found!"
+        find "${SDK_PATH}/bin/packages" -name "*.ipk"
+        exit 1
       fi
