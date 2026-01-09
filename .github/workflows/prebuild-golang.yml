@@ -63,15 +63,23 @@ jobs:
         run: |
           VERSION=23.05.3
           SDKDIR=/tmp/openwrt-sdk
-          SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+
+          # Spezialfall für bcm53xx (ASUS Router): benötigt _eabi im Namen
+          SUFFIX="_musl.Linux-x86_64"
+          if [ "$PLATFORM" == "bcm53xx" ]; then
+            SUFFIX="_musl_eabi.Linux-x86_64"
+          fi
+
+          SDK_ARCHIVE="openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}.tar.xz"
           DOWNLOAD_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${PLATFORM}/${SUBTARGET}/${SDK_ARCHIVE}"
-          SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0_musl.Linux-x86_64"
-          # Make SDK_PATH available to other steps
+          SDK_PATH="${SDKDIR}/openwrt-sdk-${VERSION}-${PLATFORM}-${SUBTARGET}_gcc-12.3.0${SUFFIX}"
+          
+          # Den Pfad für die nächsten Schritte verfügbar machen
           echo "SDK_PATH=${SDK_PATH}" >> "$GITHUB_ENV"
           
           mkdir -p "${SDKDIR}"
-          echo "Downloading SDK..."
-          (cd "${SDKDIR}" && curl -O "${DOWNLOAD_URL}")
+          echo "Downloading SDK from: ${DOWNLOAD_URL}"
+          (cd "${SDKDIR}" && curl -L -O "${DOWNLOAD_URL}")
           
           echo "Extracting SDK..."
           tar -I "xz -T0" -xf "${SDKDIR}/${SDK_ARCHIVE}" -C "${SDKDIR}"
