@@ -34,7 +34,7 @@ jobs:
 
       - name: Upload Test File to Blossom
         id: upload_test
-        continue-on-error: true
+        
         uses: c03rad0r/cli-blossom-uploader-go@main
         with:
           host: "https://blossom.swissdash.site"
