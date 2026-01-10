@@ -98,27 +98,25 @@ runs:
         
         # 1. Prebuilt Golang installieren (falls vorhanden)
         if [ -d "${{ github.workspace }}/prebuilt" ]; then
-          echo "Installing prebuilt Golang..."
+          echo "Installing prebuilt Golang from artifacts..."
           mkdir -p "bin/packages/${PLATFORM}/custom"
           cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
         fi
         
-        # 2. Feeds konfigurieren
-        cp "${{ github.workspace }}/feeds.conf" feeds.conf
+        # 2. Feeds konfigurieren (Telephony entfernen, um Index-Fehler zu vermeiden)
+        # Dies behebt den Exit Code 1 durch kaputte Makefiles im Telephony-Feed
+        grep -v "telephony" "${{ github.workspace }}/feeds.conf" > feeds.conf
         
         # 3. Feeds updaten
         ./scripts/feeds update -a
         
-        # 4. NUR die wichtigsten Feeds installieren (vermeidet Fehler in telephony)
-        ./scripts/feeds install -a -p base
-        ./scripts/feeds install -a -p packages
-        # Telephony-Fehler ignorieren wir durch '|| true'
-        ./scripts/feeds install -a -p telephony || true 
+        # 4. Feeds installieren
         ./scripts/feeds install -a
 
     - name: Manual Module Checkout
       shell: bash
       run: |
+        # Direktes Klonen umgeht Feed-Index-Probleme ("target pattern contains no '%'")
         cd "${SDK_PATH}/package"
         MODULE_NAME="${{ inputs.module }}"
         REPO_URL="https://github.com/OpenTollGate/${MODULE_NAME}.git"
@@ -129,8 +127,11 @@ runs:
       shell: bash
       run: |
         cd "${SDK_PATH}"
+        # Konfiguration generieren
         make defconfig
+        # Golang helper bereitstellen
         cp ${{ github.action_path }}/golang.mk include/golang.mk
+        # Modul aktivieren und kompilieren
         echo "CONFIG_PACKAGE_${{ inputs.module }}=y" >> .config
         make package/${{ inputs.module }}/compile V=s
 
@@ -138,6 +139,7 @@ runs:
       id: validate_package
       shell: bash
       run: |
+        # Suche nach der erzeugten .ipk Datei im bin-Verzeichnis
         PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ inputs.module }}_*.ipk" | head -n 1)
         
         if [ -n "$PACKAGE_FULLPATH" ]; then
