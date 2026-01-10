@@ -91,12 +91,12 @@ runs:
             echo "GOARM=7" >> $GITHUB_ENV
           fi
 
-    - name: Setup Golang and Feeds
+      - name: Setup Golang and Feeds
       shell: bash
       run: |
         cd "${SDK_PATH}"
         
-        # 1. Prebuilt Golang installieren (falls vorhanden)
+        # 1. Prebuilt Golang installieren
         if [ -d "${{ github.workspace }}/prebuilt" ]; then
           mkdir -p "bin/packages/${PLATFORM}/custom"
           cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
@@ -108,12 +108,8 @@ runs:
         # 3. Feeds updaten
         ./scripts/feeds update -a
         
-        # 4. NUR die wichtigsten Feeds installieren (vermeidet Fehler in telephony)
-        ./scripts/feeds install -a -p base
-        ./scripts/feeds install -a -p packages
-        # Telephony-Fehler ignorieren wir durch '|| true'
-        ./scripts/feeds install -a -p telephony || true 
-        ./scripts/feeds install -a
+        # 4. Feeds installieren (Fehler bei kaputten Paketen ignorieren)
+        ./scripts/feeds install -a || true
 
     - name: Manual Module Checkout
       shell: bash
