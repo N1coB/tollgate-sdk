@@ -5,6 +5,10 @@ inputs:
   module-name:
     description: 'Name of the module to build'
     required: true
+  package-path:
+    description: 'Path to the package source within the repository (e.g. package/my-module)'
+    required: false
+    default: '.'
   device:
     description: 'Target device (e.g., gl-mt6000)'
     required: true
@@ -45,7 +49,8 @@ runs:
       id: check-go
       shell: bash
       run: |
-        if [ -f "module/go.sum" ]; then
+        # Check inside the specific package path
+        if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
           echo "Found go.sum - Go caching will be enabled"
         else
@@ -59,7 +64,8 @@ runs:
       with:
         go-version: '1.21'
         cache: true
-        cache-dependency-path: module/go.sum
+        # Point cache to the correct go.sum location
+        cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
     - name: Setup Go (without cache)
       if: steps.check-go.outputs.has_go == 'false'
@@ -86,7 +92,7 @@ runs:
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
         
-        # FIX: Remove archive to prevent wildcard matching both file and dir
+        # Remove archive to prevent wildcard matching issues
         rm "$SDK_FILE"
         
         mv openwrt-sdk-* sdk
@@ -95,7 +101,8 @@ runs:
       shell: bash
       run: |
         mkdir -p sdk/package/${{ inputs.module-name }}
-        cp -r module/* sdk/package/${{ inputs.module-name }}/
+        # Copy ONLY the contents of the package subdirectory
+        cp -r module/${{ inputs.package-path }}/* sdk/package/${{ inputs.module-name }}/
 
     - name: Build package
       shell: bash
