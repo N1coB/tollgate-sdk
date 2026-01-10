@@ -68,8 +68,9 @@ jobs:
         uses: ./
         with:
           module-name: ${{ matrix.module }}
-          # WICHTIG: Hier definieren wir den Pfad zum Modul innerhalb des Repos
-          package-path: "package/${{ matrix.module }}"
+          # FIX: Check out the actual module repository instead of the SDK repo
+          module-repository: "OpenTollGate/${{ matrix.module }}"
+          package-path: "."
           device: ${{ matrix.target.model }}
           target: ${{ matrix.target.platform }}
           subtarget: ${{ matrix.target.subtarget }}
