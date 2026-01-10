@@ -5,8 +5,12 @@ inputs:
   module-name:
     description: 'Name of the module to build'
     required: true
+  module-repository:
+    description: 'Repository of the module (e.g. OpenTollGate/tollgate-module-basic-go)'
+    required: false
+    default: ${{ github.repository }}
   package-path:
-    description: 'Path to the package source within the repository (e.g. package/my-module)'
+    description: 'Path to the package source within the repository (e.g. . or package/my-module)'
     required: false
     default: '.'
   device:
@@ -43,13 +47,13 @@ runs:
     - name: Checkout module repository
       uses: actions/checkout@v4
       with:
+        repository: ${{ inputs.module-repository }}
         path: module
 
     - name: Check for Go module
       id: check-go
       shell: bash
       run: |
-        # Check inside the specific package path
         if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
           echo "Found go.sum - Go caching will be enabled"
@@ -64,7 +68,6 @@ runs:
       with:
         go-version: '1.21'
         cache: true
-        # Point cache to the correct go.sum location
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
     - name: Setup Go (without cache)
@@ -91,17 +94,13 @@ runs:
         
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
-        
-        # Remove archive to prevent wildcard matching issues
         rm "$SDK_FILE"
-        
         mv openwrt-sdk-* sdk
 
     - name: Prepare module package
       shell: bash
       run: |
         mkdir -p sdk/package/${{ inputs.module-name }}
-        # Copy ONLY the contents of the package subdirectory
         cp -r module/${{ inputs.package-path }}/* sdk/package/${{ inputs.module-name }}/
 
     - name: Build package
