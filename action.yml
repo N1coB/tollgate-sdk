@@ -60,7 +60,7 @@ runs:
           echo "has_go=false" >> $GITHUB_OUTPUT
         fi
 
-    # Caching Steps for Speed Optimization
+    # Caching Steps
     - name: Cache SDK and Feeds
       id: cache-sdk
       uses: actions/cache@v4
@@ -70,6 +70,7 @@ runs:
           !sdk/bin
           !sdk/build_dir
           !sdk/tmp
+          !sdk/dl
         # Key includes feeds.conf hash so we rebuild if dependencies change
         key: sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${{ hashFiles('feeds.conf') }}
 
@@ -89,7 +90,7 @@ runs:
         cache: true
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
-    # SDK Download - Only runs if Cache MISS
+    # SDK Download
     - name: Download OpenWRT SDK
       if: steps.cache-sdk.outputs.cache-hit != 'true'
       shell: bash
@@ -110,10 +111,10 @@ runs:
         rm "$SDK_FILE"
         mv openwrt-sdk-* sdk
         
-        # Initial cleanup to save space
+        # Cleanup to save space
         rm -rf sdk/bin sdk/build_dir
 
-    # Environment Setup - Runs EVERY time to ensure consistency (and fix libc issue)
+    # Environment Setup
     - name: Setup Custom Golang Environment & Feeds
       shell: bash
       run: |
@@ -122,7 +123,6 @@ runs:
         # 1. Inject custom Golang package into SDK
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
-          # Force overwrite to ensure we have latest version from repo
           cp -r lang/golang/* sdk/package/golang/
         else
           echo "Error: lang/golang directory not found"
@@ -139,16 +139,22 @@ runs:
         if [ "${{ steps.cache-sdk.outputs.cache-hit }}" != "true" ]; then
           echo "Cache miss: Running full feeds update..."
           ./scripts/feeds update -a
+          
+          # FORCE install our custom golang first to ensure precedence
+          ./scripts/feeds install -p custom golang
+          
+          # Install rest of the packages (will prompt to override golang, which we ignore/skip)
           ./scripts/feeds install -a
         else
-          echo "Cache hit: Running lightweight feeds install..."
-          # Re-install ensures symlinks are correct even if moved/restored
+          echo "Cache hit: Refreshing feeds..."
+          # Always force re-install of custom golang to ensure correct links
+          ./scripts/feeds install -f -p custom golang
           ./scripts/feeds install -a
         fi
         cd ..
         
-        # 4. Critical: Inject Makefiles for Golang Build System
-        # This fixes the libc errors and ensures correct build flags
+        # 4. Critical: Inject Makefiles for Golang Build System into include/
+        # This overwrites any system defaults with our cross-compile aware versions
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
@@ -163,23 +169,29 @@ runs:
         mkdir -p sdk/package/${{ inputs.module-name }}
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
-        # Create local source tarball to avoid git fetch issues in SDK
+        # Create local source tarball
         mkdir -p sdk/dl
         tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
         
         cd sdk/package/${{ inputs.module-name }}
         
-        # Patch Makefile to use local tarball
-        sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+        echo "Patching Makefile to use local source..."
+        # Regex update: use \s* to handle potential spaces/tabs
+        sed -i 's|^\s*PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+        
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
-            sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
+            sed -i 's/^\s*PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
         else
-            sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
+            sed -i '/^\s*PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
         fi
-        sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
-        sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
-        sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
-        sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+        
+        sed -i 's/^\s*PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
+        sed -i 's/^\s*PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
+        sed -i 's/^\s*PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
+        sed -i 's/^\s*PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+        
+        echo "Makefile contents after patch (head):"
+        head -n 20 Makefile
 
     - name: Build package
       shell: bash
@@ -188,7 +200,7 @@ runs:
         # Configure
         make defconfig
         
-        # Build - using V=w (Warnings) instead of V=s (All) to reduce log size and I/O time
+        # Build - V=w is a good balance between silent and full verbose
         echo "Starting build..."
         make package/${{ inputs.module-name }}/compile V=w -j$(nproc) || \
         make package/${{ inputs.module-name }}/compile V=s -j1
@@ -198,6 +210,11 @@ runs:
       shell: bash
       run: |
         PACKAGE_FILE=$(find sdk/bin/packages -name "${{ inputs.module-name }}*.ipk" | head -1)
+        # If the package name in Makefile differs from module-name (e.g. tollgate-wrt), try broader search
+        if [ -z "$PACKAGE_FILE" ]; then
+             PACKAGE_FILE=$(find sdk/bin/packages -name "*.ipk" | grep -v "golang" | grep -v "lib" | head -1)
+        fi
+        
         if [ -z "$PACKAGE_FILE" ]; then
           echo "Error: Built package not found"
           exit 1
