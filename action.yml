@@ -85,6 +85,10 @@ runs:
         
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
+        
+        # FIX: Remove archive to prevent wildcard matching both file and dir
+        rm "$SDK_FILE"
+        
         mv openwrt-sdk-* sdk
 
     - name: Prepare module package
