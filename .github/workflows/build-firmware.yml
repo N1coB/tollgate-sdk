@@ -44,9 +44,6 @@ jobs:
       matrix:
         module: ["tollgate-module-basic-go"]
         target: [
-          {model: "gl-ar300m", platform: "ath79", subtarget: "generic"},
-          {model: "gl-mt3000", platform: "mediatek", subtarget: "filogic"},
-          {model: "gl-mt6000", platform: "mediatek", subtarget: "filogic"},
           {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"}
         ]
     steps:
@@ -70,13 +67,14 @@ jobs:
         id: build_firmware
         uses: ./
         with:
-          model: ${{ matrix.target.model }}
-          platform: ${{ matrix.target.platform }}
+          # Mapping workflow matrix to action.yml inputs
+          module-name: ${{ matrix.module }}
+          device: ${{ matrix.target.model }}
+          target: ${{ matrix.target.platform }}   # Fix für den Download-Pfad (bcm53xx statt leer)
           subtarget: ${{ matrix.target.subtarget }}
-          prebuilt_golang: ${{ github.event_name == 'workflow_run' && 'prebuilt' || '' }}
-          module: ${{ matrix.module }}
-          packageName: ${{ matrix.module }}
-          makeFilePath: "package/${{ matrix.module }}/Makefile"
+          # Diese Inputs sind in action.yml required:
+          blossom-server: "https://blossom.swissdash.site"
+          nostr-private-key: ${{ secrets.NSECBECH }}
 
       - name: Debug Package Path
         run: |
@@ -102,6 +100,7 @@ jobs:
 
       - name: Upload Package Artifact
         uses: actions/upload-artifact@v4
+        if: env.PACKAGE_FULLPATH != ''
         with:
           name: package-${{ matrix.target.model }}-${{ matrix.module }}
           path: ${{ env.PACKAGE_FULLPATH }}
@@ -110,6 +109,7 @@ jobs:
       - name: Upload Package to Blossom
         id: upload_package
         continue-on-error: true
+        if: env.PACKAGE_FULLPATH != ''
         uses: c03rad0r/cli-blossom-uploader-go@main
         with:
           host: "https://blossom.swissdash.site"
