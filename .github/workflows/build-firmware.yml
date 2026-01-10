@@ -68,13 +68,10 @@ jobs:
         uses: ./
         with:
           module-name: ${{ matrix.module }}
-          # Verweist auf das externe Repo des Moduls:
+          # FIX: Verweis auf das externe Modul-Repo
           module-repository: "OpenTollGate/${{ matrix.module }}"
-          # Pfad zur Makefile INNERHALB des Modul-Repos.
-          # Wenn Makefile im Root liegt, nutze ".".
-          # Wenn es in "package/tollgate-module-basic-go" liegt, nutze das.
-          # Basierend auf den Logs (Error 128) und den Fehlern zuvor, scheint die Struktur so zu sein:
-          package-path: "package/${{ matrix.module }}" 
+          # FIX: Der Pfad ist nun "." (Root des Modul-Repos), nicht "package/..."
+          package-path: "." 
           device: ${{ matrix.target.model }}
           target: ${{ matrix.target.platform }}
           subtarget: ${{ matrix.target.subtarget }}
