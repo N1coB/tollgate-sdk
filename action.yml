@@ -54,6 +54,7 @@ runs:
       id: check-go
       shell: bash
       run: |
+        # Check inside the specific package path
         if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
           echo "Found go.sum - Go caching will be enabled"
@@ -68,6 +69,7 @@ runs:
       with:
         go-version: '1.21'
         cache: true
+        # Point cache to the correct go.sum location
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
     - name: Setup Go (without cache)
@@ -94,7 +96,10 @@ runs:
         
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
+        
+        # Remove archive to prevent wildcard matching issues with mv
         rm "$SDK_FILE"
+        
         mv openwrt-sdk-* sdk
 
     - name: Prepare module package
@@ -104,7 +109,8 @@ runs:
         mkdir -p sdk/package/${{ inputs.module-name }}
         
         # 2. Copy the Package Definition to SDK
-        cp -r module/${{ inputs.package-path }}/* sdk/package/${{ inputs.module-name }}/
+        # Using '/.' ensures we copy contents including hidden files, and cp -a preserves attributes
+        cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
         # 3. Create a local source tarball from the CHECKOUT.
         # This bypasses the need for the SDK to download from GitHub.
@@ -117,15 +123,23 @@ runs:
         
         echo "Patching Makefile to use local source..."
         
-        # Change Protocol to file
-        sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
         # Change URL to local dl directory
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+        
+        # Ensure PROTO is file (replace if exists, otherwise append after URL to be safe)
+        if grep -q "PKG_SOURCE_PROTO" Makefile; then
+            sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
+        else
+            sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
+        fi
+        
         # Change Source File Name
         sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
+        
         # Skip Hash Verification (since we just created the file)
         sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
+        
         # Force version to 'local' to avoid git mismatch errors
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
