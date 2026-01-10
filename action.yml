@@ -100,8 +100,37 @@ runs:
     - name: Prepare module package
       shell: bash
       run: |
+        # 1. Create package directory in SDK
         mkdir -p sdk/package/${{ inputs.module-name }}
+        
+        # 2. Copy the Package Definition to SDK
         cp -r module/${{ inputs.package-path }}/* sdk/package/${{ inputs.module-name }}/
+        
+        # 3. Create a local source tarball from the CHECKOUT.
+        # This bypasses the need for the SDK to download from GitHub.
+        mkdir -p sdk/dl
+        # Create tarball of the module content (excluding .git)
+        tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
+        
+        # 4. Patch the Makefile in the SDK to use the local tarball
+        cd sdk/package/${{ inputs.module-name }}
+        
+        echo "Patching Makefile to use local source..."
+        
+        # Change Protocol to file
+        sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
+        # Change URL to local dl directory
+        sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+        # Change Source File Name
+        sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
+        # Skip Hash Verification (since we just created the file)
+        sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
+        sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
+        # Force version to 'local' to avoid git mismatch errors
+        sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+        
+        echo "Patched Makefile content (grep PKG_):"
+        grep "PKG_" Makefile || true
 
     - name: Build package
       shell: bash
