@@ -67,12 +67,12 @@ jobs:
         id: build_firmware
         uses: ./
         with:
-          # Mapping workflow matrix to action.yml inputs
           module-name: ${{ matrix.module }}
+          # WICHTIG: Hier definieren wir den Pfad zum Modul innerhalb des Repos
+          package-path: "package/${{ matrix.module }}"
           device: ${{ matrix.target.model }}
-          target: ${{ matrix.target.platform }}   # Fix für den Download-Pfad (bcm53xx statt leer)
+          target: ${{ matrix.target.platform }}
           subtarget: ${{ matrix.target.subtarget }}
-          # Diese Inputs sind in action.yml required:
           blossom-server: "https://blossom.swissdash.site"
           nostr-private-key: ${{ secrets.NSECBECH }}
 
