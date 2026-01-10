@@ -91,13 +91,14 @@ runs:
             echo "GOARM=7" >> $GITHUB_ENV
           fi
 
-      - name: Setup Golang and Feeds
+    - name: Setup Golang and Feeds
       shell: bash
       run: |
         cd "${SDK_PATH}"
         
-        # 1. Prebuilt Golang installieren
+        # 1. Prebuilt Golang installieren (falls vorhanden)
         if [ -d "${{ github.workspace }}/prebuilt" ]; then
+          echo "Installing prebuilt Golang..."
           mkdir -p "bin/packages/${PLATFORM}/custom"
           cp ${{ github.workspace }}/prebuilt/golang*.ipk "bin/packages/${PLATFORM}/custom/"
         fi
@@ -108,8 +109,12 @@ runs:
         # 3. Feeds updaten
         ./scripts/feeds update -a
         
-        # 4. Feeds installieren (Fehler bei kaputten Paketen ignorieren)
-        ./scripts/feeds install -a || true
+        # 4. NUR die wichtigsten Feeds installieren (vermeidet Fehler in telephony)
+        ./scripts/feeds install -a -p base
+        ./scripts/feeds install -a -p packages
+        # Telephony-Fehler ignorieren wir durch '|| true'
+        ./scripts/feeds install -a -p telephony || true 
+        ./scripts/feeds install -a
 
     - name: Manual Module Checkout
       shell: bash
@@ -134,9 +139,13 @@ runs:
       shell: bash
       run: |
         PACKAGE_FULLPATH=$(find "${SDK_PATH}/bin/packages" -name "${{ inputs.module }}_*.ipk" | head -n 1)
+        
         if [ -n "$PACKAGE_FULLPATH" ]; then
+          echo "Found package at: $PACKAGE_FULLPATH"
           echo "package_path=$PACKAGE_FULLPATH" >> $GITHUB_OUTPUT
           echo "PACKAGE_FULLPATH=$PACKAGE_FULLPATH" >> $GITHUB_ENV
         else
-          echo "ERROR: Compiled IPK not found!" && exit 1
+          echo "ERROR: Compiled IPK not found!"
+          find "${SDK_PATH}/bin/packages" -name "*.ipk"
+          exit 1
         fi
