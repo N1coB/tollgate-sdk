@@ -101,7 +101,6 @@ runs:
       run: |
         echo "Setting up custom environment..."
         
-        # 1. Inject custom Golang package
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
           cp -r lang/golang/* sdk/package/golang/
@@ -110,29 +109,22 @@ runs:
           exit 1
         fi
         
-        # 2. Setup Feeds (GitHub Mirrors + Base Feed)
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
         fi
-        
-        # Add base feed if missing (REQUIRED for lua headers)
+
+        # FIX: Ensure base feed exists and rewrite to GitHub mirrors
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
              echo "Adding missing base feed..."
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
-
-        # Switch to GitHub mirrors to avoid 503 errors
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
         
-        echo "::group::Final feeds.conf content"
-        cat sdk/feeds.conf
-        echo "::endgroup::"
-        
-        # 3. Inject Golang Makefiles
+        # Inject Golang Makefiles
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
@@ -150,7 +142,7 @@ runs:
         
         cd sdk/package/${{ inputs.module-name }}
         
-        # Standard Makefile patching
+        # 1. Standard Makefile patching for Source URL
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
             sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
@@ -162,15 +154,26 @@ runs:
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        # CRITICAL FIX: Patch 'go build' to use cross-compiler variables
-        # This prevents the 'libc.so.6' missing error by ensuring we don't link against host libc
+        # 2. CRITICAL FIX: Ensure golang-package.mk is included
+        # This provides the $(GO_PKG_TARGET_VARS) variable needed for cross-compilation
+        if ! grep -q "golang-package.mk" Makefile; then
+           echo "Injecting golang-package.mk include..."
+           sed -i '/include $(INCLUDE_DIR)\/package.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
+        fi
+
+        # 3. CRITICAL FIX: Patch 'go build' to use cross-compiler variables
+        # Matches 'go build' preceded by tab or space and inserts the variable
         if grep -q "go build" Makefile; then
-           echo "Patching Makefile to enable cross-compilation for go build..."
+           echo "Patching Makefile to enable cross-compilation..."
+           # Replace tab+go build
            sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
+           # Replace space+go build (just in case)
+           sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
         fi
         
-        echo "Patched Makefile content:"
+        echo "::group::Patched Makefile content"
         cat Makefile
+        echo "::endgroup::"
 
     - name: Build package
       shell: bash
@@ -185,6 +188,11 @@ runs:
            echo "Feed update failed (attempt $n/5). Retrying in 10 seconds..."
            sleep 10
         done
+        
+        if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
+           echo "CRITICAL ERROR: Feeds failed to download."
+           exit 1
+        fi
         
         ./scripts/feeds install -f -p custom golang
         ./scripts/feeds install -a
