@@ -179,11 +179,26 @@ runs:
       shell: bash
       working-directory: sdk
       run: |
-        # Update feeds
-        ./scripts/feeds update -a
+        # Update feeds with retry loop to handle 503 errors
+        echo "Updating feeds..."
+        n=0
+        until [ "$n" -ge 5 ]
+        do
+           ./scripts/feeds update -a && break
+           n=$((n+1)) 
+           echo "Feed update failed (attempt $n/5). Retrying in 10 seconds..."
+           sleep 10
+        done
+        
+        # Fail if routing feed is missing (failed to clone)
+        if [ ! -d "feeds/routing" ]; then
+          echo "Error: Critical feeds failed to update/clone."
+          exit 1
+        fi
         
         # FORCE install our custom golang first to ensure precedence
-        ./scripts/feeds install -p custom golang
+        # Added -f to force overwrite if core packages conflict
+        ./scripts/feeds install -f -p custom golang
         
         # Install rest of the packages
         ./scripts/feeds install -a
