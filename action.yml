@@ -119,10 +119,19 @@ runs:
         # 2. Copy optimized feeds.conf
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
+          
+          # FIX: Rewrite feeds to use GitHub mirrors because git.openwrt.org is unstable (503 errors)
+          echo "Switching feeds to GitHub mirrors..."
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
+          
+          echo "New feeds.conf content:"
+          cat sdk/feeds.conf
         fi
         
         # 3. Critical: Inject Makefiles for Golang Build System into include/
-        # This overwrites system defaults to ensure cross-compilation uses target libc
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
@@ -138,13 +147,10 @@ runs:
         mkdir -p sdk/package/${{ inputs.module-name }}
         
         # 2. Copy the Package Definition to SDK
-        # Using '/.' ensures we copy contents including hidden files, and cp -a preserves attributes
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
         # 3. Create a local source tarball from the CHECKOUT.
-        # This bypasses the need for the SDK to download from GitHub.
         mkdir -p sdk/dl
-        # Create tarball of the module content (excluding .git)
         tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
         
         # 4. Patch the Makefile in the SDK to use the local tarball
@@ -155,7 +161,7 @@ runs:
         # Change URL to local dl directory
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
         
-        # Ensure PROTO is file (replace if exists, otherwise append after URL to be safe)
+        # Ensure PROTO is file
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
             sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
         else
@@ -165,11 +171,11 @@ runs:
         # Change Source File Name
         sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
         
-        # Skip Hash Verification (since we just created the file)
+        # Skip Hash Verification
         sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         
-        # Force version to 'local' to avoid git mismatch errors
+        # Force version to 'local'
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
         echo "Patched Makefile content (grep PKG_):"
@@ -179,7 +185,7 @@ runs:
       shell: bash
       working-directory: sdk
       run: |
-        # Update feeds with retry loop to handle 503 errors
+        # Update feeds with retry loop
         echo "Updating feeds..."
         n=0
         until [ "$n" -ge 5 ]
@@ -190,14 +196,13 @@ runs:
            sleep 10
         done
         
-        # Fail if routing feed is missing (failed to clone)
-        if [ ! -d "feeds/routing" ]; then
-          echo "Error: Critical feeds failed to update/clone."
-          exit 1
+        # VERIFY feeds actually exist
+        if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
+           echo "CRITICAL ERROR: Feeds failed to download. Check git.openwrt.org status or GitHub mirrors."
+           exit 1
         fi
         
-        # FORCE install our custom golang first to ensure precedence
-        # Added -f to force overwrite if core packages conflict
+        # FORCE install custom golang (-f overwrites existing core package link)
         ./scripts/feeds install -f -p custom golang
         
         # Install rest of the packages
@@ -254,7 +259,6 @@ runs:
     - name: Create Nostr announcement
       shell: bash
       run: |
-        # Create nostr event announcing the package
         cat > event.json << EOF
         {
           "kind": 1063,
@@ -268,6 +272,5 @@ runs:
           ]
         }
         EOF
-        
-        echo "Nostr event created (signing would happen here with actual implementation)"
+        echo "Nostr event created"
         cat event.json
