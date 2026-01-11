@@ -54,7 +54,6 @@ runs:
       id: check-go
       shell: bash
       run: |
-        # Check inside the specific package path
         if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
           echo "Found go.sum - Go caching will be enabled"
@@ -69,7 +68,6 @@ runs:
       with:
         go-version: '1.21'
         cache: true
-        # Point cache to the correct go.sum location
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
     - name: Setup Go (without cache)
@@ -85,7 +83,6 @@ runs:
         SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/openwrt-sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}_gcc-*.Linux-x86_64.tar.xz"
         echo "Downloading SDK from: $SDK_URL"
         
-        # Find exact SDK filename
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
         
@@ -96,10 +93,7 @@ runs:
         
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
-        
-        # Remove archive to prevent wildcard matching issues with mv
         rm "$SDK_FILE"
-        
         mv openwrt-sdk-* sdk
 
     - name: Setup Custom Build Environment
@@ -107,7 +101,7 @@ runs:
       run: |
         echo "Setting up custom environment..."
         
-        # 1. Inject custom Golang package into SDK
+        # 1. Inject custom Golang package
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
           cp -r lang/golang/* sdk/package/golang/
@@ -116,21 +110,18 @@ runs:
           exit 1
         fi
         
-        # 2. Copy optimized feeds.conf
+        # 2. Setup Feeds (GitHub Mirrors + Base Feed)
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
         fi
-
-        # FIX: Ensure 'base' feed exists and switch everything to GitHub mirrors (solves 503 and missing lua.h)
-        echo "Optimizing feeds.conf for GitHub mirrors..."
         
-        # If 'base' feed is missing, append it (needed for lua headers)
+        # Add base feed if missing (REQUIRED for lua headers)
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
              echo "Adding missing base feed..."
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
 
-        # Rewrite URLs to GitHub
+        # Switch to GitHub mirrors to avoid 503 errors
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
@@ -141,61 +132,50 @@ runs:
         cat sdk/feeds.conf
         echo "::endgroup::"
         
-        # 3. Critical: Inject Makefiles for Golang Build System into include/
+        # 3. Inject Golang Makefiles
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
         cp lang/golang/golang-build.sh sdk/include/
         chmod +x sdk/include/golang-build.sh
-        
-        echo "Environment setup complete."
 
     - name: Prepare module package
       shell: bash
       run: |
-        # 1. Create package directory in SDK
         mkdir -p sdk/package/${{ inputs.module-name }}
-        
-        # 2. Copy the Package Definition to SDK
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
-        # 3. Create a local source tarball from the CHECKOUT.
         mkdir -p sdk/dl
         tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
         
-        # 4. Patch the Makefile in the SDK to use the local tarball
         cd sdk/package/${{ inputs.module-name }}
         
-        echo "Patching Makefile to use local source..."
-        
-        # Change URL to local dl directory
+        # Standard Makefile patching
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
-        
-        # Ensure PROTO is file
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
             sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
         else
             sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
         fi
-        
-        # Change Source File Name
         sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
-        
-        # Skip Hash Verification
         sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
-        
-        # Force version to 'local'
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        echo "Patched Makefile content (grep PKG_):"
-        grep "PKG_" Makefile || true
+        # CRITICAL FIX: Patch 'go build' to use cross-compiler variables
+        # This prevents the 'libc.so.6' missing error by ensuring we don't link against host libc
+        if grep -q "go build" Makefile; then
+           echo "Patching Makefile to enable cross-compilation for go build..."
+           sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
+        fi
+        
+        echo "Patched Makefile content:"
+        cat Makefile
 
     - name: Build package
       shell: bash
       working-directory: sdk
       run: |
-        # Update feeds with retry loop
         echo "Updating feeds..."
         n=0
         until [ "$n" -ge 5 ]
@@ -206,19 +186,9 @@ runs:
            sleep 10
         done
         
-        # VERIFY feeds actually exist
-        if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
-           echo "CRITICAL ERROR: Feeds failed to download. Check git.openwrt.org status or GitHub mirrors."
-           exit 1
-        fi
-        
-        # FORCE install custom golang (-f overwrites existing core package link)
         ./scripts/feeds install -f -p custom golang
-        
-        # Install rest of the packages (includes base packages like lua now)
         ./scripts/feeds install -a
         
-        # Configure
         make defconfig
         
         # Build the package
@@ -250,10 +220,8 @@ runs:
       shell: bash
       run: |
         PACKAGE_PATH="${{ steps.find-package.outputs.package_path }}"
-        PACKAGE_NAME=$(basename "$PACKAGE_PATH")
         HASH="${{ steps.hash.outputs.sha256 }}"
         
-        # Upload to blossom server
         RESPONSE=$(curl -X PUT \
           -H "Content-Type: application/octet-stream" \
           -H "X-SHA-256: $HASH" \
@@ -282,5 +250,4 @@ runs:
           ]
         }
         EOF
-        echo "Nostr event created"
         cat event.json
