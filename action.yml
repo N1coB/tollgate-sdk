@@ -54,33 +54,14 @@ runs:
       id: check-go
       shell: bash
       run: |
+        # Check inside the specific package path
         if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
+          echo "Found go.sum - Go caching will be enabled"
         else
           echo "has_go=false" >> $GITHUB_OUTPUT
+          echo "No go.sum found - skipping Go cache"
         fi
-
-    # Caching Steps
-    - name: Cache SDK and Feeds
-      id: cache-sdk
-      uses: actions/cache@v4
-      with:
-        path: |
-          sdk
-          !sdk/bin
-          !sdk/build_dir
-          !sdk/tmp
-          !sdk/dl
-        # Key includes feeds.conf hash so we rebuild SDK if dependencies change
-        key: sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${{ hashFiles('feeds.conf') }}
-
-    - name: Cache OpenWrt Go Downloads
-      uses: actions/cache@v4
-      with:
-        path: sdk/dl
-        key: openwrt-dl-${{ hashFiles('module/**/go.sum') }}
-        restore-keys: |
-          openwrt-dl-
 
     - name: Setup Go (conditional)
       if: steps.check-go.outputs.has_go == 'true'
@@ -88,16 +69,23 @@ runs:
       with:
         go-version: '1.21'
         cache: true
+        # Point cache to the correct go.sum location
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
-    # SDK Download
+    - name: Setup Go (without cache)
+      if: steps.check-go.outputs.has_go == 'false'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: false
+
     - name: Download OpenWRT SDK
-      if: steps.cache-sdk.outputs.cache-hit != 'true'
       shell: bash
       run: |
         SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/openwrt-sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}_gcc-*.Linux-x86_64.tar.xz"
         echo "Downloading SDK from: $SDK_URL"
         
+        # Find exact SDK filename
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
         
@@ -108,14 +96,13 @@ runs:
         
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
-        rm "$SDK_FILE"
-        mv openwrt-sdk-* sdk
         
-        # Cleanup to save space
-        rm -rf sdk/bin sdk/build_dir
+        # Remove archive to prevent wildcard matching issues with mv
+        rm "$SDK_FILE"
+        
+        mv openwrt-sdk-* sdk
 
-    # Environment Setup
-    - name: Setup Custom Golang Environment & Feeds
+    - name: Setup Custom Build Environment
       shell: bash
       run: |
         echo "Setting up custom environment..."
@@ -128,32 +115,13 @@ runs:
           echo "Error: lang/golang directory not found"
           exit 1
         fi
-
+        
         # 2. Copy optimized feeds.conf
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
         fi
-
-        # 3. Handle Feeds Update/Install
-        cd sdk
-        if [ "${{ steps.cache-sdk.outputs.cache-hit }}" != "true" ]; then
-          echo "Cache miss: Running full feeds update..."
-          ./scripts/feeds update -a
-          
-          # FORCE install our custom golang first to ensure precedence
-          ./scripts/feeds install -p custom golang
-          
-          # Install rest of the packages (ignore errors/overrides for golang)
-          ./scripts/feeds install -a
-        else
-          echo "Cache hit: Refreshing feeds..."
-          # Always force re-install of custom golang to ensure correct links
-          ./scripts/feeds install -f -p custom golang
-          ./scripts/feeds install -a
-        fi
-        cd ..
         
-        # 4. Critical: Inject Makefiles for Golang Build System into include/
+        # 3. Critical: Inject Makefiles for Golang Build System into include/
         # This overwrites system defaults to ensure cross-compilation uses target libc
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
@@ -166,43 +134,65 @@ runs:
     - name: Prepare module package
       shell: bash
       run: |
+        # 1. Create package directory in SDK
         mkdir -p sdk/package/${{ inputs.module-name }}
+        
+        # 2. Copy the Package Definition to SDK
+        # Using '/.' ensures we copy contents including hidden files, and cp -a preserves attributes
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
-        # Create local source tarball
+        # 3. Create a local source tarball from the CHECKOUT.
+        # This bypasses the need for the SDK to download from GitHub.
         mkdir -p sdk/dl
+        # Create tarball of the module content (excluding .git)
         tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
         
+        # 4. Patch the Makefile in the SDK to use the local tarball
         cd sdk/package/${{ inputs.module-name }}
         
         echo "Patching Makefile to use local source..."
-        # Use more flexible regex to handle potential whitespace
-        sed -i 's|^\s*PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
         
+        # Change URL to local dl directory
+        sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+        
+        # Ensure PROTO is file (replace if exists, otherwise append after URL to be safe)
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
-            sed -i 's/^\s*PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
+            sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
         else
-            sed -i '/^\s*PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
+            sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
         fi
         
-        sed -i 's/^\s*PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
-        sed -i 's/^\s*PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
-        sed -i 's/^\s*PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
-        sed -i 's/^\s*PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+        # Change Source File Name
+        sed -i 's/^PKG_SOURCE:=.*/PKG_SOURCE:=${{ inputs.module-name }}-local.tar.xz/' Makefile
         
-        echo "Makefile contents after patch (head):"
-        head -n 20 Makefile
+        # Skip Hash Verification (since we just created the file)
+        sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
+        sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
+        
+        # Force version to 'local' to avoid git mismatch errors
+        sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+        
+        echo "Patched Makefile content (grep PKG_):"
+        grep "PKG_" Makefile || true
 
     - name: Build package
       shell: bash
       working-directory: sdk
       run: |
+        # Update feeds
+        ./scripts/feeds update -a
+        
+        # FORCE install our custom golang first to ensure precedence
+        ./scripts/feeds install -p custom golang
+        
+        # Install rest of the packages
+        ./scripts/feeds install -a
+        
         # Configure
         make defconfig
         
-        # Build - V=w is a good balance between silent and full verbose
-        echo "Starting build..."
-        make package/${{ inputs.module-name }}/compile V=w -j$(nproc) || \
+        # Build the package
+        make package/${{ inputs.module-name }}/compile V=s -j$(nproc) || \
         make package/${{ inputs.module-name }}/compile V=s -j1
 
     - name: Find built package
@@ -210,11 +200,6 @@ runs:
       shell: bash
       run: |
         PACKAGE_FILE=$(find sdk/bin/packages -name "${{ inputs.module-name }}*.ipk" | head -1)
-        # Fallback search if package name differs from module name
-        if [ -z "$PACKAGE_FILE" ]; then
-             PACKAGE_FILE=$(find sdk/bin/packages -name "*.ipk" | grep -v "golang" | grep -v "lib" | head -1)
-        fi
-        
         if [ -z "$PACKAGE_FILE" ]; then
           echo "Error: Built package not found"
           exit 1
@@ -228,14 +213,17 @@ runs:
       run: |
         HASH=$(sha256sum ${{ steps.find-package.outputs.package_path }} | cut -d' ' -f1)
         echo "sha256=$HASH" >> $GITHUB_OUTPUT
+        echo "Package SHA256: $HASH"
 
     - name: Upload to Blossom
       id: upload
       shell: bash
       run: |
         PACKAGE_PATH="${{ steps.find-package.outputs.package_path }}"
+        PACKAGE_NAME=$(basename "$PACKAGE_PATH")
         HASH="${{ steps.hash.outputs.sha256 }}"
         
+        # Upload to blossom server
         RESPONSE=$(curl -X PUT \
           -H "Content-Type: application/octet-stream" \
           -H "X-SHA-256: $HASH" \
@@ -243,6 +231,7 @@ runs:
           "${{ inputs.blossom-server }}/upload")
         
         echo "Upload response: $RESPONSE"
+        
         URL="${{ inputs.blossom-server }}/$HASH"
         echo "url=$URL" >> $GITHUB_OUTPUT
         echo "hash=$HASH" >> $GITHUB_OUTPUT
@@ -250,6 +239,7 @@ runs:
     - name: Create Nostr announcement
       shell: bash
       run: |
+        # Create nostr event announcing the package
         cat > event.json << EOF
         {
           "kind": 1063,
@@ -263,4 +253,6 @@ runs:
           ]
         }
         EOF
+        
+        echo "Nostr event created (signing would happen here with actual implementation)"
         cat event.json
