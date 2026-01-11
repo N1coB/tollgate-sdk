@@ -119,17 +119,27 @@ runs:
         # 2. Copy optimized feeds.conf
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
-          
-          # FIX: Rewrite feeds to use GitHub mirrors because git.openwrt.org is unstable (503 errors)
-          echo "Switching feeds to GitHub mirrors..."
-          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
-          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
-          sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
-          sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
-          
-          echo "New feeds.conf content:"
-          cat sdk/feeds.conf
         fi
+
+        # FIX: Ensure 'base' feed exists and switch everything to GitHub mirrors (solves 503 and missing lua.h)
+        echo "Optimizing feeds.conf for GitHub mirrors..."
+        
+        # If 'base' feed is missing, append it (needed for lua headers)
+        if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
+             echo "Adding missing base feed..."
+             echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
+        fi
+
+        # Rewrite URLs to GitHub
+        sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
+        sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
+        sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
+        sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
+        sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
+        
+        echo "::group::Final feeds.conf content"
+        cat sdk/feeds.conf
+        echo "::endgroup::"
         
         # 3. Critical: Inject Makefiles for Golang Build System into include/
         cp golang.mk sdk/include/golang.mk
@@ -205,7 +215,7 @@ runs:
         # FORCE install custom golang (-f overwrites existing core package link)
         ./scripts/feeds install -f -p custom golang
         
-        # Install rest of the packages
+        # Install rest of the packages (includes base packages like lua now)
         ./scripts/feeds install -a
         
         # Configure
