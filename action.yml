@@ -210,11 +210,11 @@ runs:
       run: |
         echo "::notice title=Build Progress::Step 6/6: Processing Artifacts..."
         
-        # FIX: Use 'find -print -quit' to safely get the first match without broken pipes
-        PACKAGE_FILE=$(find sdk/bin/packages -type f -name "*.ipk" -print -quit)
+        # FIX: Find specifically the built module using inputs.module-name
+        PACKAGE_FILE=$(find sdk/bin/packages -type f -name "${{ inputs.module-name }}*.ipk" -print -quit)
         
         if [ -z "$PACKAGE_FILE" ]; then
-          echo "::error::Build failed: No .ipk file found in sdk/bin/packages! Please check the compile step logs."
+          echo "::error::Build failed: No .ipk file found for ${{ inputs.module-name }}!"
           ls -R sdk/bin/packages || true
           exit 1
         fi
@@ -222,31 +222,14 @@ runs:
         echo "package_path=$PACKAGE_FILE" >> $GITHUB_OUTPUT
         echo "Found package: $PACKAGE_FILE"
 
-    - name: Calculate Hash
-      id: hash
-      shell: bash
-      run: |
-        HASH=$(sha256sum ${{ steps.find-package.outputs.package_path }} | cut -d' ' -f1)
-        echo "sha256=$HASH" >> $GITHUB_OUTPUT
-
+    # FIX: Use dedicated action for NIP-98 Authentication
     - name: Upload to Blossom
       id: upload
-      shell: bash
-      run: |
-        PACKAGE_PATH="${{ steps.find-package.outputs.package_path }}"
-        HASH="${{ steps.hash.outputs.sha256 }}"
-        
-        RESPONSE=$(curl -X PUT \
-          -H "Content-Type: application/octet-stream" \
-          -H "X-SHA-256: $HASH" \
-          --data-binary "@$PACKAGE_PATH" \
-          "${{ inputs.blossom-server }}/upload")
-        
-        echo "Upload response: $RESPONSE"
-        
-        URL="${{ inputs.blossom-server }}/$HASH"
-        echo "url=$URL" >> $GITHUB_OUTPUT
-        echo "hash=$HASH" >> $GITHUB_OUTPUT
+      uses: c03rad0r/cli-blossom-uploader-go@main
+      with:
+        host: ${{ inputs.blossom-server }}
+        filePath: ${{ steps.find-package.outputs.package_path }}
+        nostrPrivateKey: ${{ inputs.nostr-private-key }}
 
     - name: Create Nostr announcement
       shell: bash
