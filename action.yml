@@ -6,39 +6,39 @@ inputs:
     description: 'Name of the module to build'
     required: true
   module-repository:
-    description: 'Repository of the module (e.g. OpenTollGate/tollgate-module-basic-go)'
+    description: 'Repository of the module'
     required: false
     default: ${{ github.repository }}
   package-path:
-    description: 'Path to the package source within the repository (e.g. . or package/my-module)'
+    description: 'Path to the package source'
     required: false
     default: '.'
   device:
-    description: 'Target device (e.g., gl-mt6000)'
+    description: 'Target device'
     required: true
   target:
-    description: 'OpenWRT target (e.g., mediatek)'
+    description: 'OpenWRT target'
     required: true
   subtarget:
-    description: 'OpenWRT subtarget (e.g., filogic)'
+    description: 'OpenWRT subtarget'
     required: true
   sdk-version:
     description: 'OpenWRT SDK version'
     required: false
     default: '23.05.3'
   blossom-server:
-    description: 'Blossom server URL for upload'
+    description: 'Blossom server URL'
     required: true
   nostr-private-key:
-    description: 'Nostr private key for event signing'
+    description: 'Nostr private key'
     required: true
 
 outputs:
   package-hash:
-    description: 'SHA256 hash of the built package'
+    description: 'SHA256 hash'
     value: ${{ steps.upload.outputs.hash }}
   package-url:
-    description: 'Blossom URL of the uploaded package'
+    description: 'Blossom URL'
     value: ${{ steps.upload.outputs.url }}
 
 runs:
@@ -56,38 +56,39 @@ runs:
       run: |
         if [ -f "module/${{ inputs.package-path }}/go.sum" ]; then
           echo "has_go=true" >> $GITHUB_OUTPUT
-          echo "Found go.sum - Go caching will be enabled"
         else
           echo "has_go=false" >> $GITHUB_OUTPUT
-          echo "No go.sum found - skipping Go cache"
         fi
 
-    - name: Setup Go (conditional)
-      if: steps.check-go.outputs.has_go == 'true'
+    - name: Setup Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
-        cache: true
+        cache: ${{ steps.check-go.outputs.has_go == 'true' }}
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
-    - name: Setup Go (without cache)
-      if: steps.check-go.outputs.has_go == 'false'
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-        cache: false
-
-    - name: Download OpenWRT SDK
+    - name: Prepare SDK and Environment
       shell: bash
       run: |
-        SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/openwrt-sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}_gcc-*.Linux-x86_64.tar.xz"
-        echo "Downloading SDK from: $SDK_URL"
+        # Function for progress logging
+        function log_progress() {
+          echo "::notice title=Build Progress::$1"
+          echo "=========================================="
+          echo ">>> $1"
+          echo "=========================================="
+        }
+
+        log_progress "Step 1/6: Downloading OpenWrt SDK..."
         
+        SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/openwrt-sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}_gcc-*.Linux-x86_64.tar.xz"
+        
+        # Determine exact filename via API/listing first to avoid 404
+        # We try to fetch the index page
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
         
         if [ -z "$SDK_FILE" ]; then
-          echo "Error: Could not find SDK file"
+          echo "::error::Could not determine SDK filename automatically."
           exit 1
         fi
         
@@ -95,54 +96,53 @@ runs:
         tar -xf "$SDK_FILE"
         rm "$SDK_FILE"
         mv openwrt-sdk-* sdk
-
-    - name: Setup Custom Build Environment
-      shell: bash
-      run: |
-        echo "Setting up custom environment..."
+        
+        log_progress "Step 2/6: Setting up build environment..."
         
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
           cp -r lang/golang/* sdk/package/golang/
         else
-          echo "Error: lang/golang directory not found"
+          echo "::error::lang/golang directory not found in repository."
           exit 1
         fi
         
+        # Setup Feeds
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
         fi
 
-        # FIX: Ensure base feed exists and rewrite to GitHub mirrors
+        # FIX: Force GitHub mirrors and ensure base feed exists
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
-             echo "Adding missing base feed..."
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
+        
+        # Replace unstable git.openwrt.org with github.com
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
         
-        # Inject Golang Makefiles
+        # Copy Makefile helpers
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
         cp lang/golang/golang-build.sh sdk/include/
         chmod +x sdk/include/golang-build.sh
 
-    - name: Prepare module package
-      shell: bash
-      run: |
+        log_progress "Step 3/6: Preparing package sources..."
+        
         mkdir -p sdk/package/${{ inputs.module-name }}
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
         
         mkdir -p sdk/dl
         tar --exclude=.git -C module/${{ inputs.package-path }} -c . | xz > sdk/dl/${{ inputs.module-name }}-local.tar.xz
         
+        # --- CRITICAL MAKEFILE PATCHING ---
         cd sdk/package/${{ inputs.module-name }}
         
-        # 1. Standard Makefile patching for Source URL
+        # 1. Update Source URL
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
             sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
@@ -154,32 +154,32 @@ runs:
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        # 2. CRITICAL FIX: Ensure golang-package.mk is included
-        # This provides the $(GO_PKG_TARGET_VARS) variable needed for cross-compilation
+        # 2. Fix Missing Include (Needed for Go variables)
         if ! grep -q "golang-package.mk" Makefile; then
            echo "Injecting golang-package.mk include..."
-           sed -i '/include $(INCLUDE_DIR)\/package.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
+           # Insert after rules.mk
+           sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
         fi
 
-        # 3. CRITICAL FIX: Patch 'go build' to use cross-compiler variables
-        # Matches 'go build' preceded by tab or space and inserts the variable
+        # 3. Fix Compilation Command (Inject Cross-Compiler Vars)
+        # Replaces "go build" with "$(GO_PKG_TARGET_VARS) go build"
         if grep -q "go build" Makefile; then
-           echo "Patching Makefile to enable cross-compilation..."
-           # Replace tab+go build
+           echo "Patching go build command for cross-compilation..."
            sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
-           # Replace space+go build (just in case)
            sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
         fi
         
-        echo "::group::Patched Makefile content"
+        echo "Final Makefile Content:"
         cat Makefile
-        echo "::endgroup::"
+        cd ../../..
 
-    - name: Build package
+    - name: Update Feeds
       shell: bash
       working-directory: sdk
       run: |
-        echo "Updating feeds..."
+        echo "::notice title=Build Progress::Step 4/6: Updating and Installing Feeds..."
+        
+        # Retry loop for feeds update
         n=0
         until [ "$n" -ge 5 ]
         do
@@ -189,39 +189,47 @@ runs:
            sleep 10
         done
         
+        # Fail fast if feeds are empty
         if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
-           echo "CRITICAL ERROR: Feeds failed to download."
+           echo "::error::Feeds failed to download. Check network/mirrors."
            exit 1
         fi
         
         ./scripts/feeds install -f -p custom golang
         ./scripts/feeds install -a
+
+    - name: Compile Package
+      shell: bash
+      working-directory: sdk
+      run: |
+        echo "::notice title=Build Progress::Step 5/6: Compiling ${{ inputs.module-name }}..."
         
         make defconfig
         
-        # Build the package
+        # Compile with verbose output
         make package/${{ inputs.module-name }}/compile V=s -j$(nproc) || \
         make package/${{ inputs.module-name }}/compile V=s -j1
 
-    - name: Find built package
+    - name: Process Artifacts
       id: find-package
       shell: bash
       run: |
+        echo "::notice title=Build Progress::Step 6/6: Processing Artifacts..."
+        
         PACKAGE_FILE=$(find sdk/bin/packages -name "${{ inputs.module-name }}*.ipk" | head -1)
         if [ -z "$PACKAGE_FILE" ]; then
-          echo "Error: Built package not found"
+          echo "::error::Build failed: .ipk file not found!"
           exit 1
         fi
         echo "package_path=$PACKAGE_FILE" >> $GITHUB_OUTPUT
         echo "Found package: $PACKAGE_FILE"
 
-    - name: Calculate package hash
+    - name: Calculate Hash
       id: hash
       shell: bash
       run: |
         HASH=$(sha256sum ${{ steps.find-package.outputs.package_path }} | cut -d' ' -f1)
         echo "sha256=$HASH" >> $GITHUB_OUTPUT
-        echo "Package SHA256: $HASH"
 
     - name: Upload to Blossom
       id: upload
@@ -235,8 +243,6 @@ runs:
           -H "X-SHA-256: $HASH" \
           --data-binary "@$PACKAGE_PATH" \
           "${{ inputs.blossom-server }}/upload")
-        
-        echo "Upload response: $RESPONSE"
         
         URL="${{ inputs.blossom-server }}/$HASH"
         echo "url=$URL" >> $GITHUB_OUTPUT
@@ -258,4 +264,5 @@ runs:
           ]
         }
         EOF
+        echo "::notice::Nostr Event Created:"
         cat event.json
