@@ -6,31 +6,31 @@ inputs:
     description: 'Name of the module to build'
     required: true
   module-repository:
-    description: 'Repository of the module (e.g. OpenTollGate/tollgate-module-basic-go)'
+    description: 'Repository of the module'
     required: false
     default: ${{ github.repository }}
   package-path:
-    description: 'Path to the package source within the repository (e.g. . or package/my-module)'
+    description: 'Path to the package source'
     required: false
     default: '.'
   device:
-    description: 'Target device (e.g., gl-mt6000)'
+    description: 'Target device'
     required: true
   target:
-    description: 'OpenWRT target (e.g., mediatek)'
+    description: 'OpenWRT target'
     required: true
   subtarget:
-    description: 'OpenWRT subtarget (e.g., filogic)'
+    description: 'OpenWRT subtarget'
     required: true
   sdk-version:
     description: 'OpenWRT SDK version'
     required: false
     default: '23.05.3'
   blossom-server:
-    description: 'Blossom server URL for upload'
+    description: 'Blossom server URL'
     required: true
   nostr-private-key:
-    description: 'Nostr private key for event signing'
+    description: 'Nostr private key'
     required: true
 
 outputs:
@@ -60,26 +60,31 @@ runs:
           echo "has_go=false" >> $GITHUB_OUTPUT
         fi
 
+    # FIX 1: Upgrade Host Go to 1.24 to satisfy go.mod requirements
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.21'
+        go-version: '1.24'
+        check-latest: true
         cache: ${{ steps.check-go.outputs.has_go == 'true' }}
         cache-dependency-path: module/${{ inputs.package-path }}/go.sum
 
     - name: Prepare SDK and Environment
       shell: bash
       run: |
-        echo "::notice title=Build Progress::Step 1/6: Downloading OpenWrt SDK..."
+        # --- Progress Log Function ---
+        function log_progress() {
+          echo "::notice title=Build Progress::$1"
+          echo ">>> $1"
+        }
+
+        log_progress "Step 1/6: Downloading OpenWrt SDK..."
         
-        SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/openwrt-sdk-${{ inputs.sdk-version }}-${{ inputs.target }}-${{ inputs.subtarget }}_gcc-*.Linux-x86_64.tar.xz"
-        
-        # Determine exact filename via API/listing first to avoid 404
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
         
         if [ -z "$SDK_FILE" ]; then
-          echo "::error::Could not determine SDK filename automatically."
+          echo "::error::Could not determine SDK filename. Check OpenWrt download servers."
           exit 1
         fi
         
@@ -88,7 +93,7 @@ runs:
         rm "$SDK_FILE"
         mv openwrt-sdk-* sdk
         
-        echo "::notice title=Build Progress::Step 2/6: Setting up build environment..."
+        log_progress "Step 2/6: Setting up build environment..."
         
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
@@ -97,30 +102,38 @@ runs:
           echo "::error::lang/golang directory not found in repository."
           exit 1
         fi
+
+        # FIX 2: Patch SDK Golang Makefile to version 1.24.2
+        # This ensures the SDK builds a cross-compiler that is new enough
+        if [ -f sdk/package/golang/golang/Makefile ]; then
+            echo "Patching SDK Go version to 1.24.2..."
+            sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
+            sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
+        fi
         
+        # Setup Feeds
         if [ -f "feeds.conf" ]; then
           cp feeds.conf sdk/feeds.conf
         fi
 
-        # FIX: Force GitHub mirrors and ensure base feed exists (solves 503 errors and missing headers)
+        # FIX 3: Force GitHub mirrors and ensure base feed exists
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
-        
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
         sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
         
-        # Copy Makefile helpers
+        # Inject Golang Makefiles
         cp golang.mk sdk/include/golang.mk
         cp lang/golang/golang-package.mk sdk/include/
         cp lang/golang/golang-values.mk sdk/include/
         cp lang/golang/golang-build.sh sdk/include/
         chmod +x sdk/include/golang-build.sh
 
-        echo "::notice title=Build Progress::Step 3/6: Preparing package sources..."
+        log_progress "Step 3/6: Preparing package sources..."
         
         mkdir -p sdk/package/${{ inputs.module-name }}
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
@@ -131,7 +144,7 @@ runs:
         # --- CRITICAL MAKEFILE PATCHING ---
         cd sdk/package/${{ inputs.module-name }}
         
-        # 1. Update Source URL to point to local tarball
+        # Standard updates
         sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
         if grep -q "PKG_SOURCE_PROTO" Makefile; then
             sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
@@ -143,23 +156,22 @@ runs:
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        # 2. Inject golang-package.mk include if missing
+        # FIX 4: Update PKG_NAME to match module-name
+        # This fixes "Build failed: .ipk file not found" because filename will now match
+        sed -i 's/^PKG_NAME:=.*/PKG_NAME:=${{ inputs.module-name }}/' Makefile
+
+        # FIX 5: Inject golang-package.mk include
         if ! grep -q "golang-package.mk" Makefile; then
-           echo "Injecting golang-package.mk include..."
-           sed -i '/include $(INCLUDE_DIR)\/package.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
+           sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
         fi
 
-        # 3. Patch 'go build' to use correct cross-compile environment variables (GO_PKG_VARS)
-        # This fixes the 'libc.so.6' dependency error by linking against the correct router libc
+        # FIX 6: Patch 'go build' to use cross-compiler variables
         if grep -q "go build" Makefile; then
-           echo "Patching Makefile to enable cross-compilation..."
-           # Replace existing 'go build' calls with environment-injected calls
-           # We try both tab and space indentations
-           sed -i 's/\tgo build/\t$(GO_PKG_VARS) go build/g' Makefile
-           sed -i 's/ go build/ $(GO_PKG_VARS) go build/g' Makefile
+           sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
+           sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
         fi
         
-        echo "::group::Patched Makefile content"
+        echo "::group::Final Makefile Content"
         cat Makefile
         echo "::endgroup::"
         cd ../../..
@@ -207,12 +219,10 @@ runs:
         echo "::notice title=Build Progress::Step 6/6: Processing Artifacts..."
         
         # Find ANY .ipk file in the packages directory
-        # Using -name "*.ipk" is safer than guessing the exact name
         PACKAGE_FILE=$(find sdk/bin/packages -type f -name "*.ipk" | head -1)
         
         if [ -z "$PACKAGE_FILE" ]; then
-          echo "::error::Build failed: No .ipk file found in sdk/bin/packages!"
-          # List directory content for debugging
+          echo "::error::Build failed: No .ipk file found in sdk/bin/packages! Please check the compile step logs."
           ls -R sdk/bin/packages || true
           exit 1
         fi
