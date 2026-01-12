@@ -1,4 +1,3 @@
-# .github/workflows/build-firmware.yml
 name: Build Firmware
 
 on:
@@ -34,7 +33,7 @@ jobs:
         with:
           host: "https://blossom.swissdash.site"
           filePath: test.txt
-          nostrPrivateKey: ${{ secrets.NSECBECH }}
+          nostrPrivateKey: ${{ secrets.NSEC }}
 
   build:
     runs-on: ubuntu-22.04
@@ -58,25 +57,165 @@ jobs:
           repo: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout SDK
+      - name: Checkout SDK Wrapper
         uses: actions/checkout@v4
         with:
           path: .
 
-      - name: Build Firmware
-        id: build_firmware
-        uses: ./
+      - name: Checkout Module Source
+        uses: actions/checkout@v4
         with:
-          module-name: ${{ matrix.module }}
-          # FIX: Verweis auf das externe Modul-Repo
-          module-repository: "OpenTollGate/${{ matrix.module }}"
-          # FIX: Der Pfad ist nun "." (Root des Modul-Repos), nicht "package/..."
-          package-path: "." 
-          device: ${{ matrix.target.model }}
-          target: ${{ matrix.target.platform }}
-          subtarget: ${{ matrix.target.subtarget }}
-          blossom-server: "https://blossom.swissdash.site"
-          nostr-private-key: ${{ secrets.NSECBECH }}
+          repository: OpenTollGate/${{ matrix.module }}
+          path: module
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+          # WICHTIG: Cache-Pfad muss auf das ausgecheckte Modul zeigen
+          cache-dependency-path: module/go.sum
+
+      - name: Prepare SDK and Build Package
+        id: build_process
+        shell: bash
+        run: |
+          # --- Helper Functions ---
+          function log_progress() {
+            echo "::notice title=Build Progress::$1"
+            echo "::group::$1"
+          }
+          function end_step() {
+            echo "::endgroup::"
+          }
+
+          log_progress "Step 1/5: Downloading OpenWrt SDK"
+          SDK_VERSION="23.05.3"
+          TARGET="${{ matrix.target.platform }}"
+          SUBTARGET="${{ matrix.target.subtarget }}"
+          
+          # URL Construction
+          SDK_URL="https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/openwrt-sdk-$SDK_VERSION-$TARGET-${SUBTARGET}_gcc-*.Linux-x86_64.tar.xz"
+          
+          # Find exact filename
+          SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/" | \
+            grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
+          
+          if [ -z "$SDK_FILE" ]; then
+            echo "::error::Could not find SDK file!"
+            exit 1
+          fi
+          
+          wget -q "https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/$SDK_FILE"
+          tar -xf "$SDK_FILE"
+          rm "$SDK_FILE"
+          mv openwrt-sdk-* sdk
+          end_step
+
+          log_progress "Step 2/5: Setting up Environment"
+          
+          mkdir -p sdk/package/golang
+          if [ -d "lang/golang" ]; then
+            cp -r lang/golang/* sdk/package/golang/
+          else
+            echo "::error::lang/golang not found!"
+            exit 1
+          fi
+          
+          # Patch SDK Golang to 1.24.2
+          if [ -f sdk/package/golang/golang/Makefile ]; then
+              sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
+              sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
+          fi
+
+          if [ -f "feeds.conf" ]; then
+            cp feeds.conf sdk/feeds.conf
+          fi
+          
+          # Force GitHub Mirrors
+          if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
+               echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
+          fi
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
+          sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
+
+          cp golang.mk sdk/include/golang.mk
+          cp lang/golang/golang-package.mk sdk/include/
+          cp lang/golang/golang-values.mk sdk/include/
+          cp lang/golang/golang-build.sh sdk/include/
+          chmod +x sdk/include/golang-build.sh
+          end_step
+
+          log_progress "Step 3/5: Preparing Package"
+          MODULE_NAME="${{ matrix.module }}"
+          mkdir -p sdk/package/$MODULE_NAME
+          cp -a module/. sdk/package/$MODULE_NAME/
+          
+          mkdir -p sdk/dl
+          tar --exclude=.git -C module -c . | xz > sdk/dl/$MODULE_NAME-local.tar.xz
+          
+          # Patch Makefile
+          cd sdk/package/$MODULE_NAME
+          sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
+          if grep -q "PKG_SOURCE_PROTO" Makefile; then
+              sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
+          else
+              sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
+          fi
+          sed -i "s/^PKG_SOURCE:=.*/PKG_SOURCE:=$MODULE_NAME-local.tar.xz/" Makefile
+          sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
+          sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
+          sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
+          
+          # Force correct package name
+          sed -i "s/^PKG_NAME:=.*/PKG_NAME:=$MODULE_NAME/" Makefile
+          
+          # Inject cross-compile logic
+          if ! grep -q "golang-package.mk" Makefile; then
+             sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
+          fi
+          if grep -q "go build" Makefile; then
+             sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
+             sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
+          fi
+          cd ../../..
+          end_step
+
+          log_progress "Step 4/5: Updating Feeds"
+          cd sdk
+          n=0
+          until [ "$n" -ge 5 ]; do
+             ./scripts/feeds update -a && break
+             n=$((n+1))
+             sleep 10
+          done
+          
+          ./scripts/feeds install -f -p custom golang
+          ./scripts/feeds install -a
+          end_step
+
+          log_progress "Step 5/5: Compiling"
+          make defconfig
+          make package/$MODULE_NAME/compile V=s -j$(nproc) || make package/$MODULE_NAME/compile V=s -j1
+          
+          # FIX: Safe find command
+          PACKAGE_FILE=$(find bin/packages -type f -name "${MODULE_NAME}*.ipk" -print -quit)
+          
+          if [ -z "$PACKAGE_FILE" ]; then
+            echo "::error::Build failed! IPK not found."
+            ls -R bin/packages
+            exit 1
+          fi
+          
+          # Make path absolute and export to ENV
+          FULL_PATH=$(readlink -f "$PACKAGE_FILE")
+          echo "PACKAGE_FULLPATH=$FULL_PATH" >> $GITHUB_ENV
+          echo "Found package at: $FULL_PATH"
+          end_step
 
       - name: Debug Package Path
         run: |
@@ -116,7 +255,8 @@ jobs:
         with:
           host: "https://blossom.swissdash.site"
           filePath: ${{ env.PACKAGE_FULLPATH }}
-          nostrPrivateKey: ${{ secrets.NSECBECH }}
+          # WICHTIG: Hier Secrets NSEC verwenden wie vom User gewünscht
+          nostrPrivateKey: ${{ secrets.NSEC }}
 
       - name: Publish Package NIP-94 Metadata
         id: publish_package
@@ -144,6 +284,7 @@ jobs:
       - name: Trigger OS Workflow
         uses: peter-evans/repository-dispatch@v2
         with:
+          # FIX: Token muss existieren, sonst Fehler "Parameter token required"
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           repository: ${{ github.repository_owner }}/tollgate-os
           event-type: update-release-json
