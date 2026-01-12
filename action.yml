@@ -71,13 +71,16 @@ runs:
     - name: Prepare SDK and Environment
       shell: bash
       run: |
-        # --- Progress Log Function ---
-        function log_progress() {
+        # --- Helper Functions ---
+        function log_step() {
           echo "::notice title=Build Progress::$1"
-          echo ">>> $1"
+          echo "::group::$1"
+        }
+        function end_step() {
+          echo "::endgroup::"
         }
 
-        log_progress "Step 1/6: Downloading OpenWrt SDK..."
+        log_step "Step 1/7: Downloading OpenWrt SDK"
         
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
@@ -87,12 +90,14 @@ runs:
           exit 1
         fi
         
+        echo "Downloading $SDK_FILE..."
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
         rm "$SDK_FILE"
         mv openwrt-sdk-* sdk
-        
-        log_progress "Step 2/6: Setting up build environment..."
+        end_step
+
+        log_step "Step 2/7: Setting up build environment"
         
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
@@ -115,6 +120,7 @@ runs:
 
         # Force GitHub mirrors and ensure base feed exists
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
+             echo "Adding base feed..."
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
@@ -128,8 +134,9 @@ runs:
         cp lang/golang/golang-values.mk sdk/include/
         cp lang/golang/golang-build.sh sdk/include/
         chmod +x sdk/include/golang-build.sh
+        end_step
 
-        log_progress "Step 3/6: Preparing package sources..."
+        log_step "Step 3/7: Preparing package sources"
         
         mkdir -p sdk/package/${{ inputs.module-name }}
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
@@ -151,7 +158,7 @@ runs:
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        # Ensure PACKAGE NAME matches INPUT name
+        # FIX PACKAGE NAME
         sed -i 's/^PKG_NAME:=.*/PKG_NAME:=${{ inputs.module-name }}/' Makefile
         
         # Inject golang-package.mk
@@ -165,15 +172,16 @@ runs:
            sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
         fi
         
-        echo "Final Makefile Content:"
-        cat Makefile
+        echo "Makefile patched successfully."
         cd ../../..
+        end_step
 
     - name: Update Feeds
       shell: bash
       working-directory: sdk
       run: |
-        echo "::notice title=Build Progress::Step 4/6: Updating and Installing Feeds..."
+        echo "::notice title=Build Progress::Step 4/7: Updating and Installing Feeds..."
+        echo "::group::Feed Update Logs"
         
         n=0
         until [ "$n" -ge 5 ]
@@ -185,30 +193,35 @@ runs:
         done
         
         if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
+           echo "::endgroup::"
            echo "::error::Feeds failed to download. Check network/mirrors."
            exit 1
         fi
         
         ./scripts/feeds install -f -p custom golang
         ./scripts/feeds install -a
+        echo "::endgroup::"
 
     - name: Compile Package
       shell: bash
       working-directory: sdk
       run: |
-        echo "::notice title=Build Progress::Step 5/6: Compiling ${{ inputs.module-name }}..."
+        echo "::notice title=Build Progress::Step 5/7: Compiling ${{ inputs.module-name }}..."
+        echo "::group::Compilation Logs"
         
         make defconfig
         
         # Compile with verbose output
         make package/${{ inputs.module-name }}/compile V=s -j$(nproc) || \
         make package/${{ inputs.module-name }}/compile V=s -j1
+        
+        echo "::endgroup::"
 
     - name: Process Artifacts
       id: find-package
       shell: bash
       run: |
-        echo "::notice title=Build Progress::Step 6/6: Processing Artifacts..."
+        echo "::notice title=Build Progress::Step 6/7: Processing Artifacts..."
         
         # FIX: Find specifically the built module using inputs.module-name
         PACKAGE_FILE=$(find sdk/bin/packages -type f -name "${{ inputs.module-name }}*.ipk" -print -quit)
@@ -222,7 +235,21 @@ runs:
         echo "package_path=$PACKAGE_FILE" >> $GITHUB_OUTPUT
         echo "Found package: $PACKAGE_FILE"
 
-    # FIX: Use dedicated action for NIP-98 Authentication
+    # NEU: Speichert die .ipk Datei als GitHub Artifact
+    - name: Upload Artifact to GitHub
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.module-name }}-ipk
+        path: ${{ steps.find-package.outputs.package_path }}
+        if-no-files-found: error
+
+    - name: Calculate Hash
+      id: hash
+      shell: bash
+      run: |
+        HASH=$(sha256sum ${{ steps.find-package.outputs.package_path }} | cut -d' ' -f1)
+        echo "sha256=$HASH" >> $GITHUB_OUTPUT
+
     - name: Upload to Blossom
       id: upload
       uses: c03rad0r/cli-blossom-uploader-go@main
@@ -234,6 +261,7 @@ runs:
     - name: Create Nostr announcement
       shell: bash
       run: |
+        echo "::notice title=Build Progress::Step 7/7: Creating Announcement"
         cat > event.json << EOF
         {
           "kind": 1063,
