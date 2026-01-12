@@ -30,13 +30,13 @@ inputs:
     description: 'Blossom server URL'
     required: true
   nostr-private-key:
-    description: 'Nostr private key'
+    description: 'Nostr private key (nsec)'
     required: true
 
 outputs:
   package-hash:
     description: 'SHA256 hash of the built package'
-    value: ${{ steps.upload.outputs.hash }}
+    value: ${{ steps.hash.outputs.sha256 }}
   package-url:
     description: 'Blossom URL of the uploaded package'
     value: ${{ steps.upload.outputs.url }}
@@ -71,8 +71,7 @@ runs:
     - name: Prepare SDK and Environment
       shell: bash
       run: |
-        # --- Helper Functions ---
-        function log_step() {
+        function log_progress() {
           echo "::notice title=Build Progress::$1"
           echo "::group::$1"
         }
@@ -80,36 +79,34 @@ runs:
           echo "::endgroup::"
         }
 
-        log_step "Step 1/7: Downloading OpenWrt SDK"
+        log_progress "Step 1/7: Downloading OpenWrt SDK"
         
         SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/" | \
           grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
         
         if [ -z "$SDK_FILE" ]; then
-          echo "::error::Could not determine SDK filename. Check OpenWrt download servers."
+          echo "::error::Could not determine SDK filename."
           exit 1
         fi
         
-        echo "Downloading $SDK_FILE..."
         wget -q "https://downloads.openwrt.org/releases/${{ inputs.sdk-version }}/targets/${{ inputs.target }}/${{ inputs.subtarget }}/$SDK_FILE"
         tar -xf "$SDK_FILE"
         rm "$SDK_FILE"
         mv openwrt-sdk-* sdk
         end_step
 
-        log_step "Step 2/7: Setting up build environment"
+        log_progress "Step 2/7: Setting up build environment"
         
         mkdir -p sdk/package/golang
         if [ -d "lang/golang" ]; then
           cp -r lang/golang/* sdk/package/golang/
         else
-          echo "::error::lang/golang directory not found in repository."
+          echo "::error::lang/golang directory not found."
           exit 1
         fi
 
         # Patch SDK Golang to 1.24.2
         if [ -f sdk/package/golang/golang/Makefile ]; then
-            echo "Patching SDK Go version to 1.24.2..."
             sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
             sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
         fi
@@ -118,9 +115,8 @@ runs:
           cp feeds.conf sdk/feeds.conf
         fi
 
-        # Force GitHub mirrors and ensure base feed exists
+        # Ensure base feed exists (needed for lua headers) and use GitHub Mirrors
         if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
-             echo "Adding base feed..."
              echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
         fi
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
@@ -136,7 +132,7 @@ runs:
         chmod +x sdk/include/golang-build.sh
         end_step
 
-        log_step "Step 3/7: Preparing package sources"
+        log_progress "Step 3/7: Preparing package sources"
         
         mkdir -p sdk/package/${{ inputs.module-name }}
         cp -a module/${{ inputs.package-path }}/. sdk/package/${{ inputs.module-name }}/
@@ -158,21 +154,21 @@ runs:
         sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
         sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
         
-        # FIX PACKAGE NAME
+        # Ensure PACKAGE NAME matches INPUT name
         sed -i 's/^PKG_NAME:=.*/PKG_NAME:=${{ inputs.module-name }}/' Makefile
         
-        # Inject golang-package.mk
+        # Inject golang-package.mk if missing
         if ! grep -q "golang-package.mk" Makefile; then
            sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
         fi
 
-        # Patch 'go build' for cross-compilation
+        # Patch 'go build' to use cross-compile vars
         if grep -q "go build" Makefile; then
            sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
            sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
         fi
         
-        echo "Makefile patched successfully."
+        cat Makefile
         cd ../../..
         end_step
 
@@ -180,23 +176,14 @@ runs:
       shell: bash
       working-directory: sdk
       run: |
-        echo "::notice title=Build Progress::Step 4/7: Updating and Installing Feeds..."
-        echo "::group::Feed Update Logs"
-        
+        echo "::notice title=Build Progress::Step 4/7: Updating Feeds..."
+        echo "::group::Feed Logs"
         n=0
-        until [ "$n" -ge 5 ]
-        do
+        until [ "$n" -ge 5 ]; do
            ./scripts/feeds update -a && break
-           n=$((n+1)) 
-           echo "Feed update failed (attempt $n/5). Retrying in 10 seconds..."
-           sleep 10
+           n=$((n+1))
+           sleep 5
         done
-        
-        if [ ! -d "feeds/luci" ] || [ ! -d "feeds/packages" ]; then
-           echo "::endgroup::"
-           echo "::error::Feeds failed to download. Check network/mirrors."
-           exit 1
-        fi
         
         ./scripts/feeds install -f -p custom golang
         ./scripts/feeds install -a
@@ -207,14 +194,9 @@ runs:
       working-directory: sdk
       run: |
         echo "::notice title=Build Progress::Step 5/7: Compiling ${{ inputs.module-name }}..."
-        echo "::group::Compilation Logs"
-        
+        echo "::group::Compile Logs"
         make defconfig
-        
-        # Compile with verbose output
-        make package/${{ inputs.module-name }}/compile V=s -j$(nproc) || \
-        make package/${{ inputs.module-name }}/compile V=s -j1
-        
+        make package/${{ inputs.module-name }}/compile V=s -j$(nproc) || make package/${{ inputs.module-name }}/compile V=s -j1
         echo "::endgroup::"
 
     - name: Process Artifacts
@@ -223,19 +205,16 @@ runs:
       run: |
         echo "::notice title=Build Progress::Step 6/7: Processing Artifacts..."
         
-        # FIX: Find specifically the built module using inputs.module-name
+        # Safe find command (avoids broken pipe error)
         PACKAGE_FILE=$(find sdk/bin/packages -type f -name "${{ inputs.module-name }}*.ipk" -print -quit)
         
         if [ -z "$PACKAGE_FILE" ]; then
-          echo "::error::Build failed: No .ipk file found for ${{ inputs.module-name }}!"
-          ls -R sdk/bin/packages || true
+          echo "::error::Build failed: No .ipk file found!"
           exit 1
         fi
         
         echo "package_path=$PACKAGE_FILE" >> $GITHUB_OUTPUT
-        echo "Found package: $PACKAGE_FILE"
 
-    # NEU: Speichert die .ipk Datei als GitHub Artifact
     - name: Upload Artifact to GitHub
       uses: actions/upload-artifact@v4
       with:
@@ -256,24 +235,24 @@ runs:
       with:
         host: ${{ inputs.blossom-server }}
         filePath: ${{ steps.find-package.outputs.package_path }}
+        # WICHTIG: Das muss im Workflow übergeben werden!
         nostrPrivateKey: ${{ inputs.nostr-private-key }}
 
     - name: Create Nostr announcement
       shell: bash
       run: |
-        echo "::notice title=Build Progress::Step 7/7: Creating Announcement"
+        echo "::notice title=Build Progress::Step 7/7: Success!"
         cat > event.json << EOF
         {
           "kind": 1063,
           "content": "New TollGate package: ${{ inputs.module-name }}",
           "tags": [
             ["url", "${{ steps.upload.outputs.url }}"],
-            ["x", "${{ steps.upload.outputs.hash }}"],
+            ["x", "${{ steps.hash.outputs.sha256 }}"],
             ["m", "application/octet-stream"],
             ["device", "${{ inputs.device }}"],
             ["target", "${{ inputs.target }}/${{ inputs.subtarget }}"]
           ]
         }
         EOF
-        echo "::notice::Nostr Event Created:"
         cat event.json
