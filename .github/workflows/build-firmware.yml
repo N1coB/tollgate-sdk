@@ -39,14 +39,16 @@ jobs:
           function log_progress() { echo "::notice title=Build Progress::$1"; echo "::group::$1"; }
           function end_step() { echo "::endgroup::"; }
 
+          # --- 1. SDK Download ---
           log_progress "Step 1/5: Downloading OpenWrt 24.10 SDK"
-          # Wir nutzen 24.10.0 als stabile Basis für alle 24.10.x Builds
+          
+          # Wir suchen im 24.10.0 Verzeichnis als stabile Basis
           SDK_URL_BASE="https://downloads.openwrt.org/releases/24.10.0/targets/${{ matrix.target.platform }}/${{ matrix.target.subtarget }}"
           
-          # Suche nach SDK (unterstützt .xz und .zst Endungen für 24.10)
+          # Suche nach SDK (unterstützt .xz und .zst)
           SDK_FILE=$(curl -s "$SDK_URL_BASE/" | grep -oP 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.(xz|zst)' | head -1)
           
-          # Fallback auf Snapshots, falls Release-Ordner noch leer ist
+          # Fallback auf Snapshots
           if [ -z "$SDK_FILE" ]; then
              SDK_URL_BASE="https://downloads.openwrt.org/snapshots/targets/${{ matrix.target.platform }}/${{ matrix.target.subtarget }}"
              SDK_FILE=$(curl -s "$SDK_URL_BASE/" | grep -oP 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.(xz|zst)' | head -1)
@@ -57,10 +59,10 @@ jobs:
              exit 1
           fi
           
-          echo "Found SDK: $SDK_FILE"
+          echo "Downloading $SDK_FILE..."
           wget -q "$SDK_URL_BASE/$SDK_FILE"
           
-          # Entpacken (zstd Support sicherstellen)
+          # Entpacken
           if [[ "$SDK_FILE" == *.zst ]]; then
              sudo apt-get update && sudo apt-get install -y zstd
              tar --use-compress-program=zstd -xf "$SDK_FILE"
@@ -72,18 +74,24 @@ jobs:
           mv openwrt-sdk-* sdk
           end_step
 
+          # --- 2. Environment Setup ---
           log_progress "Step 2/5: Setting up Environment"
           mkdir -p sdk/package/golang
           cp -r lang/golang/* sdk/package/golang/
+
+          # Patch SDK Go to 1.24
           if [ -f sdk/package/golang/golang/Makefile ]; then
               sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
               sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
           fi
-          [ -f "feeds.conf" ] && cp feeds.conf sdk/feeds.conf
-          if ! grep -q "src-git base" sdk/feeds.conf; then
-               echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-24.10" >> sdk/feeds.conf
-          fi
-          sed -i 's|git.openwrt.org/|github.com/openwrt/|g' sdk/feeds.conf
+          
+          # Feeds Konfiguration (Github Mirrors)
+          echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-24.10" > sdk/feeds.conf
+          echo "src-git packages https://github.com/openwrt/packages.git;openwrt-24.10" >> sdk/feeds.conf
+          echo "src-git luci https://github.com/openwrt/luci.git;openwrt-24.10" >> sdk/feeds.conf
+          echo "src-git routing https://github.com/openwrt/routing.git;openwrt-24.10" >> sdk/feeds.conf
+          echo "src-git telephony https://github.com/openwrt/telephony.git;openwrt-24.10" >> sdk/feeds.conf
+          
           cp golang.mk sdk/include/golang.mk
           cp lang/golang/golang-package.mk sdk/include/
           cp lang/golang/golang-values.mk sdk/include/
@@ -91,12 +99,14 @@ jobs:
           chmod +x sdk/include/golang-build.sh
           end_step
 
+          # --- 3. Preparing Package ---
           log_progress "Step 3/5: Preparing Package"
           MODULE_NAME="${{ matrix.module }}"
           mkdir -p sdk/package/$MODULE_NAME
           cp -a module/. sdk/package/$MODULE_NAME/
           mkdir -p sdk/dl
           tar --exclude=.git -C module -c . | xz > sdk/dl/$MODULE_NAME-local.tar.xz
+          
           cd sdk/package/$MODULE_NAME
           sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
           sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile || sed -i '/^PKG_SOURCE_URL:=/a PKG_SOURCE_PROTO:=file' Makefile
@@ -104,6 +114,7 @@ jobs:
           sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
           sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
           sed -i "s/^PKG_NAME:=.*/PKG_NAME:=$MODULE_NAME/" Makefile
+          
           if ! grep -q "golang-package.mk" Makefile; then
              sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
           fi
@@ -114,16 +125,24 @@ jobs:
           cd ../../..
           end_step
 
+          # --- 4. Updating Feeds (FIXED) ---
           log_progress "Step 4/5: Updating Feeds"
           cd sdk
           ./scripts/feeds update -a
+          
+          # Install custom golang first (FORCE)
           ./scripts/feeds install -f -p custom golang
-          ./scripts/feeds install -a
+          
+          # Install all other packages (IGNORE ERRORS)
+          # Das "|| true" verhindert den Abbruch bei Duplikaten (z.B. system golang vs custom golang)
+          ./scripts/feeds install -a || true
           end_step
 
+          # --- 5. Compiling ---
           log_progress "Step 5/5: Compiling"
           make defconfig
           make package/$MODULE_NAME/compile V=s -j$(nproc) || make package/$MODULE_NAME/compile V=s -j1
+          
           PACKAGE_FILE=$(find bin/packages -type f -name "${MODULE_NAME}*.ipk" -print -quit)
           if [ -z "$PACKAGE_FILE" ]; then exit 1; fi
           echo "PACKAGE_FULLPATH=$(readlink -f "$PACKAGE_FILE")" >> $GITHUB_ENV
