@@ -12,7 +12,7 @@ jobs:
       matrix:
         module: ["tollgate-module-basic-go"]
         target:
-          # Hier das gewünschte Zielgerät eintragen/auswählen:
+          # Dein Router: RT-AC56U (bcm53xx)
           - {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"}
     steps:
       - name: Checkout SDK Wrapper
@@ -37,57 +37,55 @@ jobs:
       - name: Prepare SDK and Build Package
         shell: bash
         run: |
-          # Hilfsfunktionen für Logs
           function log_progress() { echo "::notice title=Build Progress::$1"; echo "::group::$1"; }
           function end_step() { echo "::endgroup::"; }
 
-          # 1. SDK Herunterladen
-          log_progress "Step 1/5: Downloading OpenWrt SDK"
-          SDK_VERSION="23.05.3"
+          # --- 1. SDK Download (KORRIGIERT AUF 24.10.5) ---
+          log_progress "Step 1/5: Downloading OpenWrt SDK 24.10.5"
+          SDK_VERSION="24.10.5"
           TARGET="${{ matrix.target.platform }}"
           SUBTARGET="${{ matrix.target.subtarget }}"
           
-          SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/" | \
-            grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
+          # SDK URL für 24.10
+          SDK_URL_BASE="https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET"
+          
+          # Dateinamen ermitteln (API/HTML Parsing)
+          SDK_FILE=$(curl -s "$SDK_URL_BASE/" | grep -oP 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.xz' | head -1)
           
           if [ -z "$SDK_FILE" ]; then
-            echo "::error::Could not find SDK file! Check OpenWrt server status."
-            exit 1
+             echo "::error::SDK File not found for version $SDK_VERSION at $SDK_URL_BASE"
+             exit 1
           fi
           
-          wget -q "https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/$SDK_FILE"
+          echo "Downloading $SDK_FILE..."
+          wget -q "$SDK_URL_BASE/$SDK_FILE"
           tar -xf "$SDK_FILE"
           rm "$SDK_FILE"
           mv openwrt-sdk-* sdk
           end_step
 
-          # 2. Umgebung einrichten (Go & Feeds)
+          # --- 2. Environment Setup ---
           log_progress "Step 2/5: Setting up Environment"
           
-          # Go Supportdateien kopieren
           mkdir -p sdk/package/golang
-          if [ -d "lang/golang" ]; then
-            cp -r lang/golang/* sdk/package/golang/
-          else
-            echo "::error::lang/golang not found in repository!"
-            exit 1
-          fi
-          
-          # SDK Go Makefile patchen auf 1.24 (wichtig für neuere Module)
+          cp -r lang/golang/* sdk/package/golang/
+
+          # Patch Internal SDK Go Makefile (Force 1.24)
           if [ -f sdk/package/golang/golang/Makefile ]; then
               sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
               sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
           fi
 
-          # Feeds konfigurieren
-          if [ -f "feeds.conf" ]; then
-            cp feeds.conf sdk/feeds.conf
+          # Feeds Konfiguration
+          [ -f "feeds.conf" ] && cp feeds.conf sdk/feeds.conf
+          
+          # Base Feed hinzufügen falls fehlend (Wichtig für Lua Header)
+          if ! grep -q "src-git base" sdk/feeds.conf; then
+               echo "Adding base feed for 24.10..."
+               echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-24.10" >> sdk/feeds.conf
           fi
           
-          # GitHub Mirrors erzwingen (verhindert 503 Fehler)
-          if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
-               echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
-          fi
+          # GitHub Mirrors nutzen (Stabilität)
           sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' sdk/feeds.conf
           sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' sdk/feeds.conf
           sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' sdk/feeds.conf
@@ -102,20 +100,19 @@ jobs:
           chmod +x sdk/include/golang-build.sh
           end_step
 
-          # 3. Modul vorbereiten & Patchen
+          # --- 3. Package Prepare ---
           log_progress "Step 3/5: Preparing Package"
           MODULE_NAME="${{ matrix.module }}"
           mkdir -p sdk/package/$MODULE_NAME
           cp -a module/. sdk/package/$MODULE_NAME/
           
-          # Local Source Tarball erstellen (verhindert erneuten Git-Download im SDK)
+          # Local Source Tarball
           mkdir -p sdk/dl
           tar --exclude=.git -C module -c . | xz > sdk/dl/$MODULE_NAME-local.tar.xz
           
-          # Makefile im SDK patchen
           cd sdk/package/$MODULE_NAME
           
-          # Source auf lokale Datei biegen
+          # Makefile Patching
           sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
           if grep -q "PKG_SOURCE_PROTO" Makefile; then
               sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
@@ -126,42 +123,40 @@ jobs:
           sed -i 's/^PKG_HASH:=.*/PKG_HASH:=skip/' Makefile
           sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
           sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
-          
-          # WICHTIG: Paketname muss übereinstimmen
           sed -i "s/^PKG_NAME:=.*/PKG_NAME:=$MODULE_NAME/" Makefile
           
-          # Cross-Compile Logik injizieren
+          # Inject Includes & Vars
           if ! grep -q "golang-package.mk" Makefile; then
              sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
           fi
           if grep -q "go build" Makefile; then
-             # Ersetzt einfaches 'go build' durch Cross-Compile Umgebung
              sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
              sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
           fi
           cd ../../..
           end_step
 
-          # 4. Feeds aktualisieren
+          # --- 4. Update Feeds ---
           log_progress "Step 4/5: Updating Feeds"
           cd sdk
-          n=0
-          until [ "$n" -ge 5 ]; do
-             ./scripts/feeds update -a && break
-             n=$((n+1))
-             sleep 10
-          done
+          
+          # Versuch 1: Update
+          if ! ./scripts/feeds update -a; then
+             echo "::warning::Feed update failed, retrying..."
+             sleep 5
+             ./scripts/feeds update -a || echo "::warning::Feed update failed again (might be partial)"
+          fi
           
           ./scripts/feeds install -f -p custom golang
           ./scripts/feeds install -a
           end_step
 
-          # 5. Kompilieren
+          # --- 5. Compile ---
           log_progress "Step 5/5: Compiling"
           make defconfig
           make package/$MODULE_NAME/compile V=s -j$(nproc) || make package/$MODULE_NAME/compile V=s -j1
           
-          # Paket finden
+          # Find Package
           PACKAGE_FILE=$(find bin/packages -type f -name "${MODULE_NAME}*.ipk" -print -quit)
           
           if [ -z "$PACKAGE_FILE" ]; then
@@ -172,7 +167,7 @@ jobs:
           
           FULL_PATH=$(readlink -f "$PACKAGE_FILE")
           echo "PACKAGE_FULLPATH=$FULL_PATH" >> $GITHUB_ENV
-          echo "Found package at: $FULL_PATH"
+          echo "Found: $FULL_PATH"
           end_step
 
       - name: Upload Artifact to GitHub
