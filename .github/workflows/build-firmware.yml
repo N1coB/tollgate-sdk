@@ -1,62 +1,20 @@
 name: Build Firmware
 
 on:
-  workflow_run:
-    workflows: ["Prebuild Golang"]
-    types:
-      - completed
-  repository_dispatch:
-    types: [module-build-completed]
-  push:
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    branches: [ "main" ]
 
 jobs:
-  prepare:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Test Blossom Upload with Simple File
-        run: |
-          echo "This is a test file" > test.txt
-          ORIGINAL_HASH=$(sha256sum test.txt | cut -d' ' -f1)
-          echo "ORIGINAL_HASH=$ORIGINAL_HASH" >> $GITHUB_ENV
-
-      - name: Upload Test File to Blossom
-        id: upload_test
-        continue-on-error: true
-        uses: c03rad0r/cli-blossom-uploader-go@main
-        with:
-          host: "https://blossom.swissdash.site"
-          filePath: test.txt
-          nostrPrivateKey: ${{ secrets.NSEC }}
-
   build:
     runs-on: ubuntu-22.04
-    needs: prepare
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     strategy:
       matrix:
         module: ["tollgate-module-basic-go"]
-        target: [
-          {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"}
-        ]
+        target:
+          # Hier das gewünschte Zielgerät eintragen/auswählen:
+          - {model: "rt-ac56u", platform: "bcm53xx", subtarget: "generic"}
     steps:
-      - name: Download Prebuilt Golang
-        uses: dawidd6/action-download-artifact@v2
-        continue-on-error: true
-        with:
-          workflow: prebuild-golang.yml
-          workflow_conclusion: success
-          name: golang-${{ matrix.target.model }}-${{ matrix.target.platform }}-${{ matrix.target.subtarget }}
-          path: prebuilt/
-          repo: ${{ github.repository }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Checkout SDK Wrapper
         uses: actions/checkout@v4
         with:
@@ -74,36 +32,26 @@ jobs:
           go-version: '1.24'
           check-latest: true
           cache: true
-          # WICHTIG: Cache-Pfad muss auf das ausgecheckte Modul zeigen
           cache-dependency-path: module/go.sum
 
       - name: Prepare SDK and Build Package
-        id: build_process
         shell: bash
         run: |
-          # --- Helper Functions ---
-          function log_progress() {
-            echo "::notice title=Build Progress::$1"
-            echo "::group::$1"
-          }
-          function end_step() {
-            echo "::endgroup::"
-          }
+          # Hilfsfunktionen für Logs
+          function log_progress() { echo "::notice title=Build Progress::$1"; echo "::group::$1"; }
+          function end_step() { echo "::endgroup::"; }
 
+          # 1. SDK Herunterladen
           log_progress "Step 1/5: Downloading OpenWrt SDK"
           SDK_VERSION="23.05.3"
           TARGET="${{ matrix.target.platform }}"
           SUBTARGET="${{ matrix.target.subtarget }}"
           
-          # URL Construction
-          SDK_URL="https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/openwrt-sdk-$SDK_VERSION-$TARGET-${SUBTARGET}_gcc-*.Linux-x86_64.tar.xz"
-          
-          # Find exact filename
           SDK_FILE=$(curl -s "https://downloads.openwrt.org/releases/$SDK_VERSION/targets/$TARGET/$SUBTARGET/" | \
             grep -oP 'openwrt-sdk[^"]+Linux-x86_64\.tar\.xz' | head -1)
           
           if [ -z "$SDK_FILE" ]; then
-            echo "::error::Could not find SDK file!"
+            echo "::error::Could not find SDK file! Check OpenWrt server status."
             exit 1
           fi
           
@@ -113,27 +61,30 @@ jobs:
           mv openwrt-sdk-* sdk
           end_step
 
+          # 2. Umgebung einrichten (Go & Feeds)
           log_progress "Step 2/5: Setting up Environment"
           
+          # Go Supportdateien kopieren
           mkdir -p sdk/package/golang
           if [ -d "lang/golang" ]; then
             cp -r lang/golang/* sdk/package/golang/
           else
-            echo "::error::lang/golang not found!"
+            echo "::error::lang/golang not found in repository!"
             exit 1
           fi
           
-          # Patch SDK Golang to 1.24.2
+          # SDK Go Makefile patchen auf 1.24 (wichtig für neuere Module)
           if [ -f sdk/package/golang/golang/Makefile ]; then
               sed -i 's/^GO_VERSION_MAJOR_MINOR:=.*/GO_VERSION_MAJOR_MINOR:=1.24/' sdk/package/golang/golang/Makefile
               sed -i 's/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=2/' sdk/package/golang/golang/Makefile
           fi
 
+          # Feeds konfigurieren
           if [ -f "feeds.conf" ]; then
             cp feeds.conf sdk/feeds.conf
           fi
           
-          # Force GitHub Mirrors
+          # GitHub Mirrors erzwingen (verhindert 503 Fehler)
           if ! grep -q "src-git base" sdk/feeds.conf && ! grep -q "src-git-full base" sdk/feeds.conf; then
                echo "src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05" >> sdk/feeds.conf
           fi
@@ -143,6 +94,7 @@ jobs:
           sed -i 's|git.openwrt.org/feed/routing.git|github.com/openwrt/routing.git|g' sdk/feeds.conf
           sed -i 's|git.openwrt.org/feed/telephony.git|github.com/openwrt/telephony.git|g' sdk/feeds.conf
 
+          # Makefiles kopieren
           cp golang.mk sdk/include/golang.mk
           cp lang/golang/golang-package.mk sdk/include/
           cp lang/golang/golang-values.mk sdk/include/
@@ -150,16 +102,20 @@ jobs:
           chmod +x sdk/include/golang-build.sh
           end_step
 
+          # 3. Modul vorbereiten & Patchen
           log_progress "Step 3/5: Preparing Package"
           MODULE_NAME="${{ matrix.module }}"
           mkdir -p sdk/package/$MODULE_NAME
           cp -a module/. sdk/package/$MODULE_NAME/
           
+          # Local Source Tarball erstellen (verhindert erneuten Git-Download im SDK)
           mkdir -p sdk/dl
           tar --exclude=.git -C module -c . | xz > sdk/dl/$MODULE_NAME-local.tar.xz
           
-          # Patch Makefile
+          # Makefile im SDK patchen
           cd sdk/package/$MODULE_NAME
+          
+          # Source auf lokale Datei biegen
           sed -i 's|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=$(TOPDIR)/dl|' Makefile
           if grep -q "PKG_SOURCE_PROTO" Makefile; then
               sed -i 's/^PKG_SOURCE_PROTO:=.*/PKG_SOURCE_PROTO:=file/' Makefile
@@ -171,20 +127,22 @@ jobs:
           sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' Makefile
           sed -i 's/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=local/' Makefile
           
-          # Force correct package name
+          # WICHTIG: Paketname muss übereinstimmen
           sed -i "s/^PKG_NAME:=.*/PKG_NAME:=$MODULE_NAME/" Makefile
           
-          # Inject cross-compile logic
+          # Cross-Compile Logik injizieren
           if ! grep -q "golang-package.mk" Makefile; then
              sed -i '/include $(TOPDIR)\/rules.mk/a include $(INCLUDE_DIR)/golang-package.mk' Makefile
           fi
           if grep -q "go build" Makefile; then
+             # Ersetzt einfaches 'go build' durch Cross-Compile Umgebung
              sed -i 's/\tgo build/\t$(GO_PKG_TARGET_VARS) go build/g' Makefile
              sed -i 's/ go build/ $(GO_PKG_TARGET_VARS) go build/g' Makefile
           fi
           cd ../../..
           end_step
 
+          # 4. Feeds aktualisieren
           log_progress "Step 4/5: Updating Feeds"
           cd sdk
           n=0
@@ -198,11 +156,12 @@ jobs:
           ./scripts/feeds install -a
           end_step
 
+          # 5. Kompilieren
           log_progress "Step 5/5: Compiling"
           make defconfig
           make package/$MODULE_NAME/compile V=s -j$(nproc) || make package/$MODULE_NAME/compile V=s -j1
           
-          # FIX: Safe find command
+          # Paket finden
           PACKAGE_FILE=$(find bin/packages -type f -name "${MODULE_NAME}*.ipk" -print -quit)
           
           if [ -z "$PACKAGE_FILE" ]; then
@@ -211,80 +170,15 @@ jobs:
             exit 1
           fi
           
-          # Make path absolute and export to ENV
           FULL_PATH=$(readlink -f "$PACKAGE_FILE")
           echo "PACKAGE_FULLPATH=$FULL_PATH" >> $GITHUB_ENV
           echo "Found package at: $FULL_PATH"
           end_step
 
-      - name: Debug Package Path
-        run: |
-          if [ -n "${{ env.PACKAGE_FULLPATH }}" ]; then
-            PACKAGE_HASH=$(sha256sum "${{ env.PACKAGE_FULLPATH }}" | cut -d' ' -f1)
-            echo "PACKAGE_HASH=$PACKAGE_HASH" >> $GITHUB_ENV
-            FILE_SIZE=$(stat -c%s "${{ env.PACKAGE_FULLPATH }}")
-            echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-            MODULE_NAME=$(echo "${{ matrix.module }}" | sed 's/tollgate-module-//;s/-go//')
-            echo "MODULE_NAME=$MODULE_NAME" >> $GITHUB_ENV
-            
-            if [[ "${{ matrix.target.platform }}" == "ath79" ]]; then
-              ARCH="mipsel_24kc"
-            elif [[ "${{ matrix.target.platform }}" == "mediatek" ]]; then
-              ARCH="aarch64_cortex-a53"
-            elif [[ "${{ matrix.target.platform }}" == "bcm53xx" ]]; then
-              ARCH="arm_cortex-a9"
-            else
-              ARCH="unknown"
-            fi
-            echo "ARCH=$ARCH" >> $GITHUB_ENV
-          fi
-
-      - name: Upload Package Artifact
+      - name: Upload Artifact to GitHub
         uses: actions/upload-artifact@v4
         if: env.PACKAGE_FULLPATH != ''
         with:
           name: package-${{ matrix.target.model }}-${{ matrix.module }}
           path: ${{ env.PACKAGE_FULLPATH }}
           retention-days: 5
-
-      - name: Upload Package to Blossom
-        id: upload_package
-        continue-on-error: true
-        if: env.PACKAGE_FULLPATH != ''
-        uses: c03rad0r/cli-blossom-uploader-go@main
-        with:
-          host: "https://blossom.swissdash.site"
-          filePath: ${{ env.PACKAGE_FULLPATH }}
-          # WICHTIG: Hier Secrets NSEC verwenden wie vom User gewünscht
-          nostrPrivateKey: ${{ secrets.NSEC }}
-
-      - name: Publish Package NIP-94 Metadata
-        id: publish_package
-        if: steps.upload_package.outputs.success == 'true'
-        uses: OpenTollGate/nostr-publish-file-metadata-action@v0.1.0
-        with:
-          relays: wss://relay.damus.io,wss://nos.lol,wss://nostr.mom/
-          url: ${{ steps.upload_package.outputs.url }}
-          mimeType: application/octet-stream
-          fileHash: ${{ steps.upload_package.outputs.hash }}
-          originalHash: ${{ env.PACKAGE_HASH }}
-          filename: ${{ env.MODULE_NAME }}-${{ matrix.target.model }}-${{ env.ARCH }}.ipk
-          content: "TollGate Module Package: ${{ env.MODULE_NAME }} for ${{ matrix.target.model }}"
-          nsec: ${{ secrets.NSEC }}
-          size: ${{ env.FILE_SIZE }}
-          architecture: ${{ env.ARCH }}
-          model: ${{ matrix.target.model }}
-          module: ${{ env.MODULE_NAME }}
-          version: "0.0.1"
-
-  install-os:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger OS Workflow
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          # FIX: Token muss existieren, sonst Fehler "Parameter token required"
-          token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          repository: ${{ github.repository_owner }}/tollgate-os
-          event-type: update-release-json
